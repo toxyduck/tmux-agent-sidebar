@@ -319,10 +319,11 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
 mod tests {
     use super::*;
     use crate::extension::{
-        AgentNode, AgentRole, Evidence, ExtensionsConfig, Fact, ProviderConfig, Reply, TreeNode,
+        AgentLifecycle, AgentNode, AgentRole, Evidence, ExtensionsConfig, Fact, ProviderConfig,
+        Reply, TreeNode,
     };
     use crate::group::{PaneGitInfo, RepoGroup};
-    use crate::state::{AppState, StatusFilter, SubagentTarget};
+    use crate::state::{AppState, ExtensionsState, StatusFilter, SubagentTarget};
     use crate::tmux::{AgentType, PaneInfo, PaneStatus, PermissionMode, WorktreeMetadata};
     use std::collections::BTreeMap;
 
@@ -347,6 +348,39 @@ mod tests {
             session_name: String::new(),
             sidebar_spawned: false,
             bg_shell_cmd: None,
+        }
+    }
+
+    fn reply_with_children<'a>(
+        main_id: &str,
+        children: impl IntoIterator<Item = (&'a str, &'a str, AgentLifecycle)>,
+    ) -> Reply {
+        let mut agents = vec![AgentNode {
+            id: main_id.into(),
+            parent_id: None,
+            label: format!("Main {main_id}"),
+            role: AgentRole::Main,
+            model: None,
+            lifecycle: AgentLifecycle::Running,
+            transcript_available: false,
+        }];
+        agents.extend(
+            children
+                .into_iter()
+                .map(|(id, label, lifecycle)| AgentNode {
+                    id: id.into(),
+                    parent_id: Some(main_id.into()),
+                    label: label.into(),
+                    role: AgentRole::Subagent,
+                    model: Some("model".into()),
+                    lifecycle,
+                    transcript_available: false,
+                }),
+        );
+        Reply {
+            version: 1,
+            agents,
+            ..Reply::default()
         }
     }
 
@@ -514,6 +548,163 @@ mod tests {
         assert_eq!(focused.pending_tree, unfocused.pending_tree);
         assert_eq!(focused.pending_tree, refocused.pending_tree);
         assert!(state.extensions.ui.is_expanded(&disclosure));
+    }
+
+    #[test]
+    fn two_live_scopes_keep_running_children_accented_across_selection_and_focus_round_trip() {
+        let mut first = make_pane("%1", PaneStatus::Running);
+        first.session_id = Some("one".into());
+        let mut second = make_pane("%2", PaneStatus::Running);
+        second.session_id = Some("two".into());
+        let mut state = AppState::new("%sidebar".into());
+        state.repo_groups = vec![RepoGroup {
+            name: "repo".into(),
+            has_focus: true,
+            panes: vec![
+                (first, PaneGitInfo::default()),
+                (second, PaneGitInfo::default()),
+            ],
+        }];
+        state.extensions.seed_test_inspection(
+            "%1",
+            "claude",
+            Some("one"),
+            reply_with_children(
+                "main-one",
+                [("child-one", "Running child A", AgentLifecycle::Running)],
+            ),
+        );
+        state.extensions.seed_test_inspection(
+            "%2",
+            "claude",
+            Some("two"),
+            reply_with_children(
+                "main-two",
+                [("child-two", "Running child B", AgentLifecycle::Running)],
+            ),
+        );
+        state.focus_state.sidebar_focused = true;
+        state.focus_state.focus = Focus::Panes;
+
+        let child_color = |rows: &CollectedRows, label: &str| {
+            rows.lines
+                .iter()
+                .find(|line| line.to_string().contains(label))
+                .and_then(|line| line.spans.first().and_then(|span| span.style.fg))
+        };
+        let assert_both_accented = |rows: &CollectedRows| {
+            assert_eq!(
+                child_color(rows, "Running child A"),
+                Some(state.theme.accent)
+            );
+            assert_eq!(
+                child_color(rows, "Running child B"),
+                Some(state.theme.accent)
+            );
+        };
+
+        state.global.selected_pane_row = 0;
+        assert_both_accented(&collect(&state, 80));
+        state.global.selected_pane_row = 1;
+        assert_both_accented(&collect(&state, 80));
+        state.focus_state.sidebar_focused = false;
+        assert_both_accented(&collect(&state, 80));
+        state.focus_state.sidebar_focused = true;
+        state.global.selected_pane_row = 0;
+        assert_both_accented(&collect(&state, 80));
+    }
+
+    #[test]
+    fn inactive_disclosure_persists_per_scope_until_successful_inspect_removes_children() {
+        let mut first = make_pane("%1", PaneStatus::Running);
+        first.session_id = Some("one".into());
+        let mut second = make_pane("%2", PaneStatus::Running);
+        second.session_id = Some("two".into());
+        let mut state = AppState::new("%sidebar".into());
+        state.repo_groups = vec![RepoGroup {
+            name: "repo".into(),
+            has_focus: true,
+            panes: vec![
+                (first, PaneGitInfo::default()),
+                (second, PaneGitInfo::default()),
+            ],
+        }];
+        let config = ExtensionsConfig {
+            providers: BTreeMap::from([(
+                "claude".into(),
+                ProviderConfig {
+                    argv: vec!["/bin/true".into()],
+                    timeout_ms: 100,
+                    env: BTreeMap::new(),
+                },
+            )]),
+            ..ExtensionsConfig::default()
+        };
+        let (extensions, queue) = ExtensionsState::with_test_control_queue(config);
+        state.extensions = extensions;
+        let first_reply = reply_with_children(
+            "main-one",
+            [("inactive-one", "Unknown child A", AgentLifecycle::Unknown)],
+        );
+        queue.complete_inspect("%1", "claude", Some("one"), Ok(first_reply.clone()));
+        queue.complete_inspect(
+            "%2",
+            "claude",
+            Some("two"),
+            Ok(reply_with_children(
+                "main-two",
+                [(
+                    "inactive-two",
+                    "Completed child B",
+                    AgentLifecycle::Completed,
+                )],
+            )),
+        );
+        state.extensions.take_results();
+        let disclosure = TreeTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            session_id: Some("one".into()),
+            agent_id: "main-one".into(),
+            node_id: INACTIVE_AGENTS_DISCLOSURE.into(),
+            detail_token: None,
+            inline_detail: None,
+            is_disclosure: true,
+        };
+        state.extensions.ui.toggle(&disclosure);
+        assert!(state.extensions.ui.is_expanded(&disclosure));
+
+        queue.complete_inspect("%1", "claude", Some("one"), Ok(first_reply));
+        state.extensions.take_results();
+        assert!(state.extensions.ui.is_expanded(&disclosure));
+
+        state.focus_state.sidebar_focused = true;
+        state.focus_state.focus = Focus::Panes;
+        for selected_pane_row in [0, 1, 0] {
+            state.global.selected_pane_row = selected_pane_row;
+            let lines = collect(&state, 80)
+                .lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            assert!(lines.iter().any(|line| line.contains("Unknown child A")));
+            assert!(state.extensions.ui.is_expanded(&disclosure));
+        }
+
+        queue.complete_inspect(
+            "%1",
+            "claude",
+            Some("one"),
+            Ok(reply_with_children("main-one", [])),
+        );
+        state.extensions.take_results();
+        assert!(!state.extensions.ui.is_expanded(&disclosure));
+        let lines = collect(&state, 80)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert!(!lines.iter().any(|line| line.contains("Unknown child A")));
     }
 
     #[test]

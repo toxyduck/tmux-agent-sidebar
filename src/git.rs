@@ -137,8 +137,22 @@ pub fn vcs_patch_bytes(kind: VcsKind, root: &str) -> Result<Vec<u8>, String> {
             }
             Ok(patch)
         }
-        VcsKind::Arc => command_output(root, "arc", &["diff", "--no-color", "--git"], false)
-            .map(|output| output.stdout),
+        VcsKind::Arc => {
+            let mut patch = command_output(
+                root,
+                "arc",
+                &["diff", "--cached", "--no-color", "--git"],
+                true,
+            )?
+            .stdout;
+            patch.extend(
+                command_output(root, "arc", &["diff", "--no-color", "--git"], true)?.stdout,
+            );
+            for path in arc_untracked_paths(root)? {
+                patch.extend(untracked_patch(root, &path)?);
+            }
+            Ok(patch)
+        }
     }
 }
 
@@ -223,6 +237,33 @@ fn git_untracked_paths(root: &str) -> Result<Vec<String>, String> {
         .filter(|field| field.starts_with(b"?? "))
         .map(|field| String::from_utf8_lossy(&field[3..]).into_owned())
         .collect())
+}
+
+fn arc_untracked_paths(root: &str) -> Result<Vec<String>, String> {
+    let status = command_output(root, "arc", &["status", "--json"], false)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&status.stdout).map_err(|error| error.to_string())?;
+    Ok(value
+        .get("untracked")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect())
+}
+
+fn untracked_patch(root: &str, path: &str) -> Result<Vec<u8>, String> {
+    let bytes =
+        std::fs::read(std::path::Path::new(root).join(path)).map_err(|error| error.to_string())?;
+    let lines = String::from_utf8_lossy(&bytes);
+    let count = lines.lines().count();
+    let mut patch = format!("diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{count} @@\n").into_bytes();
+    for line in lines.lines() {
+        patch.extend_from_slice(b"+");
+        patch.extend_from_slice(line.as_bytes());
+        patch.extend_from_slice(b"\n");
+    }
+    Ok(patch)
 }
 
 pub(crate) fn parse_arc_branch_json(text: &str) -> Option<String> {

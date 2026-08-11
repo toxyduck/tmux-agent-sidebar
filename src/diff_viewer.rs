@@ -7,7 +7,6 @@ use crate::git::{self, VcsKind};
 use crate::tmux;
 
 pub const DIFF_VIEWER_OPTION: &str = "@sidebar_diff_viewer_command";
-const PATCH_TARGET_OPTION: &str = "@sidebar_diff_patch_target";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PatchTarget {
@@ -27,29 +26,32 @@ pub fn parse_viewer_command(value: &str) -> Result<Vec<String>, String> {
 pub fn open_popup(kind: VcsKind, root: String) -> Result<(), String> {
     let config = tmux::get_option(DIFF_VIEWER_OPTION)
         .ok_or_else(|| format!("{DIFF_VIEWER_OPTION} is not configured"))?;
-    parse_viewer_command(&config)?;
+    let viewer = parse_viewer_command(&config)?;
+    resolve_executable(&viewer[0])?;
     let target = PatchTarget {
         kind: kind.label().to_ascii_lowercase(),
         root,
     };
     let encoded = serde_json::to_string(&target).map_err(|e| e.to_string())?;
-    tmux::run_tmux_capture(&["set", "-g", PATCH_TARGET_OPTION, &encoded])?;
     let executable =
         std::env::current_exe().map_err(|e| format!("cannot resolve sidebar binary: {e}"))?;
-    let command = format!("{} view-patch", shell_quote(&executable.to_string_lossy()));
+    let command = format!(
+        "{} view-patch {}",
+        shell_quote(&executable.to_string_lossy()),
+        shell_quote(&encoded)
+    );
     tmux::run_tmux_capture(&["display-popup", "-E", "-w", "100%", "-h", "100%", &command])
         .map(|_| ())
 }
 
-pub fn cmd_view_patch() -> i32 {
-    let target: PatchTarget =
-        match tmux::get_option(PATCH_TARGET_OPTION).and_then(|v| serde_json::from_str(&v).ok()) {
-            Some(target) => target,
-            None => {
-                eprintln!("No diff target selected");
-                return 2;
-            }
-        };
+pub fn cmd_view_patch(args: &[String]) -> i32 {
+    let target: PatchTarget = match args.first().and_then(|v| serde_json::from_str(v).ok()) {
+        Some(target) => target,
+        None => {
+            eprintln!("No diff target selected");
+            return 2;
+        }
+    };
     let kind = match target.kind.as_str() {
         "git" => VcsKind::Git,
         "arc" => VcsKind::Arc,
@@ -98,6 +100,23 @@ pub fn cmd_view_patch() -> i32 {
         .unwrap_or(1)
 }
 
+fn resolve_executable(program: &str) -> Result<(), String> {
+    if program.contains('/') {
+        return std::path::Path::new(program)
+            .is_file()
+            .then_some(())
+            .ok_or_else(|| format!("diff viewer not found: {program}"));
+    }
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(program))
+                .find(|path| path.is_file())
+        })
+        .map(|_| ())
+        .ok_or_else(|| format!("diff viewer not found in PATH: {program}"))
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -119,5 +138,19 @@ mod tests {
     #[test]
     fn quotes_single_quote_for_posix_shell() {
         assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
+    }
+    #[test]
+    fn popup_targets_are_serialized_arguments_not_shared_options() {
+        let first = serde_json::to_string(&PatchTarget {
+            kind: "git".into(),
+            root: "/one".into(),
+        })
+        .unwrap();
+        let second = serde_json::to_string(&PatchTarget {
+            kind: "arc".into(),
+            root: "/two".into(),
+        })
+        .unwrap();
+        assert_ne!(first, second);
     }
 }

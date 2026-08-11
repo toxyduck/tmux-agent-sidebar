@@ -373,7 +373,7 @@ fn patch_section_paths(section: &[u8]) -> Option<PatchPaths> {
 
 fn git_path_token_len(value: &[u8]) -> Option<usize> {
     if value.first() != Some(&b'"') {
-        return Some(value.iter().position(|byte| *byte == b' ')?);
+        return value.iter().position(|byte| *byte == b' ');
     }
     let mut escaped = false;
     for (index, byte) in value.iter().enumerate().skip(1) {

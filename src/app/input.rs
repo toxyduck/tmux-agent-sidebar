@@ -196,9 +196,7 @@ pub(super) fn handle_key_event(
                             state.open_selected_capability_detail();
                         }
                     }
-                    Some(crate::state::NavigationTarget::Subagent(target)) => {
-                        state.activate_subagent(target);
-                    }
+                    Some(crate::state::NavigationTarget::Subagent(_)) => {}
                     Some(crate::state::NavigationTarget::Pane { .. }) | None => {
                         state.activate_selected_pane();
                     }
@@ -463,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_and_enter_emit_one_identical_subagent_activation() {
+    fn child_hit_targets_and_enter_never_emit_provider_activation() {
         let _guard = crate::tmux::test_mock::install();
         let (mut mouse_state, mouse_queue, subagent, _) = activation_ready_state();
         mouse_state
@@ -471,25 +469,13 @@ mod tests {
             .subagent_line_targets
             .insert(0, subagent.clone());
         mouse_state.handle_mouse_click(2, 0);
-        let mouse_request = mouse_queue.take_activation().expect("mouse activation");
         assert!(mouse_queue.take_activation().is_none());
 
         let (mut key_state, key_queue, _, _) = activation_ready_state();
         key_state.selected_navigation_target = Some(NavigationTarget::Subagent(subagent));
         let flag = AtomicBool::new(false);
         handle_key_event(key(KeyCode::Enter), &mut key_state, &flag);
-        let key_request = key_queue.take_activation().expect("Enter activation");
         assert!(key_queue.take_activation().is_none());
-
-        assert_eq!(mouse_request, key_request);
-        let expected_cwd = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        assert_eq!(mouse_request.cwd.as_deref(), Some(expected_cwd.as_str()));
-        assert_eq!(mouse_request.pane_pid, Some(4242));
-        assert_eq!(mouse_request.current_command.as_deref(), Some("claude"));
     }
 
     #[test]
@@ -789,13 +775,6 @@ mod tests {
     #[test]
     fn pane_navigation_uses_the_same_stable_targets_as_clicks() {
         let mut state = state_with_three_panes();
-        let subagent = SubagentTarget {
-            parent_pane_id: "%1".into(),
-            provider_id: "claude".into(),
-            session_id: None,
-            agent_id: "child".into(),
-            node_id: "child".into(),
-        };
         let capability = TreeTarget {
             parent_pane_id: "%1".into(),
             provider_id: "claude".into(),
@@ -808,7 +787,6 @@ mod tests {
         };
         state.layout.navigation_targets = vec![
             NavigationTarget::Pane { row: 0 },
-            NavigationTarget::Subagent(subagent.clone()),
             NavigationTarget::Tree(capability.clone()),
             NavigationTarget::Pane { row: 1 },
         ];
@@ -818,19 +796,13 @@ mod tests {
         handle_key_event(key(KeyCode::Char('j')), &mut state, &flag);
         assert_eq!(
             state.selected_navigation_target,
-            Some(NavigationTarget::Subagent(subagent.clone()))
-        );
-        handle_key_event(key(KeyCode::Down), &mut state, &flag);
-        assert_eq!(
-            state.selected_navigation_target,
             Some(NavigationTarget::Tree(capability))
         );
-        assert_eq!(state.selected_subagent_target, Some(subagent.clone()));
         handle_key_event(key(KeyCode::Char('k')), &mut state, &flag);
-        assert!(matches!(
+        assert_eq!(
             state.selected_navigation_target,
-            Some(NavigationTarget::Subagent(_))
-        ));
+            Some(NavigationTarget::Pane { row: 0 })
+        );
     }
 
     #[test]

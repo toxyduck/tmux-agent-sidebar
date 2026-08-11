@@ -5,7 +5,7 @@ use ratatui::{
 
 use super::SPAWN_BUTTON;
 use super::row;
-use crate::state::{AppState, Focus, SubagentTarget, TreeTarget};
+use crate::state::{AppState, Focus, TreeTarget};
 use crate::ui::text::display_width;
 
 #[derive(Debug, Default)]
@@ -14,20 +14,23 @@ pub(super) struct CollectedRows {
     pub line_to_row: Vec<Option<usize>>,
     pub pending_spawn: Vec<(usize, String, String)>,
     pub pending_remove: Vec<(usize, u16, String)>,
-    pub pending_subagents: Vec<(usize, String, String, Option<String>, String, String)>,
     pub pending_tree: Vec<(usize, TreeTarget)>,
 }
 
+const INACTIVE_AGENTS_DISCLOSURE: &str = "__inactive_agents__";
+
+#[cfg(test)]
 fn agent_label(agent: &crate::extension::AgentNode) -> &str {
     &agent.label
 }
 
+#[cfg(test)]
 fn scoped_selected_agent_id(
     pane_id: &str,
     provider_id: &str,
     session_id: Option<&str>,
     agents: &[crate::extension::AgentNode],
-    subagent: Option<&SubagentTarget>,
+    subagent: Option<&crate::state::SubagentTarget>,
     tree: Option<&TreeTarget>,
 ) -> Option<String> {
     let candidate = subagent
@@ -49,6 +52,22 @@ fn scoped_selected_agent_id(
         .iter()
         .any(|agent| agent.id == candidate)
         .then(|| candidate.to_string())
+}
+
+fn agent_line(
+    marker: &str,
+    agent: &crate::extension::AgentNode,
+    color: ratatui::style::Color,
+) -> Line<'static> {
+    let model = agent
+        .model
+        .as_deref()
+        .map(|model| format!("  {model}"))
+        .unwrap_or_default();
+    Line::from(Span::styled(
+        format!("  {marker} {}{model}", agent.label),
+        Style::default().fg(color),
+    ))
 }
 
 pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
@@ -166,26 +185,70 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                     pane.agent.as_str(),
                     pane.session_id.as_deref(),
                 ) {
-                    for agent in &inspection.reply.agents {
+                    let root_id = inspection
+                        .reply
+                        .agents
+                        .iter()
+                        .find(|agent| agent.parent_id.is_none())
+                        .map(|agent| agent.id.clone())
+                        .unwrap_or_else(|| pane.pane_id.clone());
+                    let mut children: Vec<_> = inspection
+                        .reply
+                        .agents
+                        .iter()
+                        .filter(|agent| agent.parent_id.is_some())
+                        .collect();
+                    children.sort_by(|left, right| {
+                        let left_rank =
+                            matches!(left.lifecycle, crate::extension::AgentLifecycle::Running)
+                                as u8;
+                        let right_rank =
+                            matches!(right.lifecycle, crate::extension::AgentLifecycle::Running)
+                                as u8;
+                        right_rank
+                            .cmp(&left_rank)
+                            .then_with(|| left.label.cmp(&right.label))
+                            .then_with(|| left.id.cmp(&right.id))
+                    });
+                    for agent in children.iter().copied().filter(|agent| {
+                        matches!(agent.lifecycle, crate::extension::AgentLifecycle::Running)
+                    }) {
+                        pane_lines.push(agent_line("●", agent, theme.accent));
+                    }
+                    let inactive: Vec<_> = children
+                        .into_iter()
+                        .filter(|agent| {
+                            !matches!(agent.lifecycle, crate::extension::AgentLifecycle::Running)
+                        })
+                        .collect();
+                    if !inactive.is_empty() {
+                        let target = TreeTarget {
+                            parent_pane_id: pane.pane_id.clone(),
+                            provider_id: pane.agent.as_str().to_string(),
+                            session_id: pane.session_id.clone(),
+                            agent_id: root_id,
+                            node_id: INACTIVE_AGENTS_DISCLOSURE.to_string(),
+                            detail_token: None,
+                            inline_detail: None,
+                            is_disclosure: true,
+                        };
+                        let expanded = state.extensions.ui.is_expanded(&target);
+                        let disclosure = if expanded { "▼" } else { "▶" };
                         let line = collected.lines.len() + pane_lines.len();
-                        let model = agent
-                            .model
-                            .as_deref()
-                            .map(|model| format!("  {model}"))
-                            .unwrap_or_default();
                         pane_lines.push(Line::from(Span::styled(
-                            format!("  └ {}{model}", agent_label(agent)),
-                            Style::default().fg(theme.subagent),
+                            format!("  {disclosure} Inactive / unknown ({})", inactive.len()),
+                            Style::default().fg(theme.text_muted),
                         )));
-                        if agent.parent_id.is_some() {
-                            collected.pending_subagents.push((
-                                line,
-                                pane.pane_id.clone(),
-                                pane.agent.as_str().to_string(),
-                                pane.session_id.clone(),
-                                agent.id.clone(),
-                                agent.id.clone(),
-                            ));
+                        collected.pending_tree.push((line, target));
+                        if expanded {
+                            for agent in inactive {
+                                let marker = match agent.lifecycle {
+                                    crate::extension::AgentLifecycle::Completed => "○",
+                                    crate::extension::AgentLifecycle::Unknown => "?",
+                                    crate::extension::AgentLifecycle::Running => unreachable!(),
+                                };
+                                pane_lines.push(agent_line(marker, agent, theme.text_muted));
+                            }
                         }
                     }
                 }
@@ -198,23 +261,13 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                     pane.agent.as_str(),
                     pane.session_id.as_deref(),
                 );
-                let selected_agent_id = inspection.and_then(|inspection| {
-                    scoped_selected_agent_id(
-                        &pane.pane_id,
-                        pane.agent.as_str(),
-                        pane.session_id.as_deref(),
-                        &inspection.reply.agents,
-                        state.selected_subagent_target.as_ref(),
-                        state.extensions.ui.selected.as_ref(),
-                    )
-                });
                 for (offset, (line, target)) in row::render_extension_tree(
                     inspection,
                     state.extensions.config.as_ref(),
                     &pane.pane_id,
                     pane.agent.as_str(),
                     pane.session_id.as_deref(),
-                    selected_agent_id.as_deref(),
+                    None,
                     &state.extensions.ui,
                     width,
                     theme,
@@ -269,7 +322,7 @@ mod tests {
         AgentNode, AgentRole, Evidence, ExtensionsConfig, Fact, ProviderConfig, Reply, TreeNode,
     };
     use crate::group::{PaneGitInfo, RepoGroup};
-    use crate::state::{AppState, StatusFilter};
+    use crate::state::{AppState, StatusFilter, SubagentTarget};
     use crate::tmux::{AgentType, PaneInfo, PaneStatus, PermissionMode, WorktreeMetadata};
     use std::collections::BTreeMap;
 

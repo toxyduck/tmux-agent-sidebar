@@ -472,10 +472,7 @@ impl AppState {
                 self.selected_subagent_target = None;
                 self.extensions.ui.selected = None;
             }
-            NavigationTarget::Subagent(subagent) => {
-                self.selected_subagent_target = Some(subagent.clone());
-                self.extensions.ui.selected = None;
-            }
+            NavigationTarget::Subagent(_) => return false,
             NavigationTarget::Tree(tree) => {
                 if !self
                     .selected_subagent_target

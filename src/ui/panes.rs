@@ -494,16 +494,12 @@ fn selected_navigation_line(state: &AppState) -> Option<usize> {
             .tree_line_targets
             .iter()
             .find_map(|(line, candidate)| (candidate == target).then_some(*line)),
-        Some(NavigationTarget::Subagent(target)) => state
-            .layout
-            .subagent_line_targets
-            .iter()
-            .find_map(|(line, candidate)| (candidate == target).then_some(*line)),
         Some(NavigationTarget::Pane { row }) => state
             .layout
             .line_to_row
             .iter()
             .position(|mapping| *mapping == Some(*row)),
+        Some(NavigationTarget::Subagent(_)) => None,
         None => state
             .extensions
             .ui
@@ -515,15 +511,6 @@ fn selected_navigation_line(state: &AppState) -> Option<usize> {
                     .tree_line_targets
                     .iter()
                     .find_map(|(line, candidate)| (candidate == target).then_some(*line))
-            })
-            .or_else(|| {
-                state.selected_subagent_target.as_ref().and_then(|target| {
-                    state
-                        .layout
-                        .subagent_line_targets
-                        .iter()
-                        .find_map(|(line, candidate)| (candidate == target).then_some(*line))
-                })
             })
             .or_else(|| {
                 state
@@ -575,34 +562,13 @@ pub fn draw_agents(frame: &mut Frame, state: &mut AppState, area: Rect) {
         line_to_row,
         pending_spawn,
         pending_remove,
-        pending_subagents,
         pending_tree,
     } = row_collector::collect(state, layout.list_area.width);
     state.layout.line_to_row = line_to_row;
-    state.layout.subagent_line_targets = pending_subagents
-        .into_iter()
-        .map(
-            |(line, parent_pane_id, provider_id, session_id, agent_id, node_id)| {
-                (
-                    line,
-                    crate::state::SubagentTarget {
-                        parent_pane_id,
-                        provider_id,
-                        session_id,
-                        agent_id,
-                        node_id,
-                    },
-                )
-            },
-        )
-        .collect();
     state.layout.tree_line_targets = pending_tree.into_iter().collect();
     let mut seen_panes = std::collections::HashSet::new();
     state.layout.navigation_targets = (0..lines.len())
         .filter_map(|line| {
-            if let Some(target) = state.layout.subagent_line_targets.get(&line) {
-                return Some(crate::state::NavigationTarget::Subagent(target.clone()));
-            }
             if let Some(target) = state.layout.tree_line_targets.get(&line) {
                 return Some(crate::state::NavigationTarget::Tree(target.clone()));
             }

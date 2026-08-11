@@ -19,7 +19,11 @@ pub struct SubagentTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavigationTarget {
-    Pane { row: usize },
+    Pane {
+        row: usize,
+    },
+    /// Compatibility-only target retained for persisted/test state. No render,
+    /// mouse, or keyboard path constructs or activates it.
     Subagent(SubagentTarget),
     Tree(TreeTarget),
 }
@@ -75,7 +79,7 @@ pub struct FrameLayout {
     /// `pane_row_targets`. `None` for header/blank lines that should not
     /// route clicks to a pane.
     pub line_to_row: Vec<Option<usize>>,
-    /// Agent-panel source line → exact subagent in its original tmux pane.
+    /// Compatibility-only frame field. Child rows are never populated here.
     pub subagent_line_targets: HashMap<usize, SubagentTarget>,
     /// Agent and capability tree lines rendered for the selected pane.
     /// Stable `node_id` makes duplicate labels safe to select and disclose.
@@ -346,12 +350,6 @@ impl AppState {
             } else {
                 self.extensions.ui.selected = Some(target);
             }
-            return;
-        }
-        if let Some(target) = self.layout.subagent_line_targets.get(&line_index).cloned() {
-            self.selected_subagent_target = Some(target.clone());
-            self.selected_navigation_target = Some(NavigationTarget::Subagent(target.clone()));
-            self.activate_subagent(target);
             return;
         }
         if let Some(Some(agent_row)) = self.layout.line_to_row.get(line_index) {

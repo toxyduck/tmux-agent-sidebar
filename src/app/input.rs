@@ -83,6 +83,10 @@ pub(super) fn handle_key_event(
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => state.close_transcript(),
             KeyCode::Char('j') | KeyCode::Down => state.scroll_transcript(1),
             KeyCode::Char('k') | KeyCode::Up => state.scroll_transcript(-1),
+            KeyCode::PageDown => state.scroll_transcript(10),
+            KeyCode::PageUp => state.scroll_transcript(-10),
+            KeyCode::Home => state.scroll_transcript_to_start(),
+            KeyCode::End => state.scroll_transcript_to_end(),
             _ => {}
         }
         return true;
@@ -295,7 +299,7 @@ mod tests {
 
     use crate::extension::{
         AgentNode, AgentRole, ExtensionsConfig, ProviderConfig, Reply, TranscriptDocument,
-        TranscriptItem,
+        TranscriptItem, TranscriptItemKind,
     };
     use crate::group::RepoGroup;
     use crate::state::{NavigationTarget, RowTarget, SubagentTarget, TranscriptView, TreeTarget};
@@ -692,14 +696,18 @@ mod tests {
                 node_id: "worker".into(),
             },
             document: TranscriptDocument {
+                agent_id: "worker".into(),
                 title: "Worker".into(),
-                source: String::new(),
+                lifecycle: Default::default(),
+                truncated_before: false,
+                truncated_after: false,
                 items: vec![TranscriptItem {
-                    role: "assistant".into(),
+                    kind: TranscriptItemKind::Assistant,
                     text: "done".into(),
                 }],
             },
             scroll: 0,
+            max_scroll: 1,
             previous_selection: Some(target.clone()),
             previous_pane_scroll: 4,
         });

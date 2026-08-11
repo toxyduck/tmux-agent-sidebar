@@ -682,15 +682,20 @@ pub fn draw_detail(frame: &mut Frame, state: &mut AppState, area: Rect) {
 /// notices, cache rows, or diagnostic UI.
 pub fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let theme = &state.theme;
+    state.layout.transcript_back_rect = None;
     let (title, text, scroll) = if let Some(view) = state.extensions.ui.transcript.view.as_ref() {
         let mut text = String::new();
+        if view.document.truncated_before {
+            text.push_str("… earlier transcript omitted …\n\n");
+        }
         for item in &view.document.items {
-            if !item.role.is_empty() {
-                text.push_str(&item.role);
-                text.push_str(":\n");
-            }
+            text.push_str(transcript_item_label(item.kind));
+            text.push_str(":\n");
             text.push_str(&item.text);
             text.push_str("\n\n");
+        }
+        if view.document.truncated_after {
+            text.push_str("… later transcript omitted …");
         }
         (view.document.title.clone(), text, view.scroll)
     } else {
@@ -720,13 +725,51 @@ pub fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    let back = "← Back";
+    let back_width = back.len().min(inner.width as usize) as u16;
+    let back_rect = Rect::new(
+        inner.x + inner.width.saturating_sub(back_width),
+        inner.y,
+        back_width,
+        1,
+    );
+    state.layout.transcript_back_rect = Some(back_rect);
+    frame.render_widget(
+        Paragraph::new(back).style(Style::default().fg(theme.text_muted)),
+        back_rect,
+    );
+    let text_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    let wrapped_lines = text.lines().fold(0usize, |total, line| {
+        total + line.chars().count().max(1).div_ceil(inner.width as usize)
+    });
+    if let Some(view) = state.extensions.ui.transcript.view.as_mut() {
+        view.max_scroll = wrapped_lines.saturating_sub(text_area.height as usize);
+        view.scroll = view.scroll.min(view.max_scroll);
+    }
     frame.render_widget(
         Paragraph::new(text)
             .style(Style::default().fg(theme.text_active))
             .wrap(Wrap { trim: false })
             .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
-        inner,
+        text_area,
     );
+}
+
+fn transcript_item_label(kind: crate::extension::TranscriptItemKind) -> &'static str {
+    match kind {
+        crate::extension::TranscriptItemKind::User => "user",
+        crate::extension::TranscriptItemKind::Developer => "developer",
+        crate::extension::TranscriptItemKind::Assistant => "assistant",
+        crate::extension::TranscriptItemKind::Reasoning => "reasoning",
+        crate::extension::TranscriptItemKind::ToolCall => "tool call",
+        crate::extension::TranscriptItemKind::ToolResult => "tool result",
+        crate::extension::TranscriptItemKind::Event => "event",
+    }
 }
 
 #[cfg(test)]

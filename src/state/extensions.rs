@@ -51,6 +51,7 @@ pub struct TranscriptView {
     pub target: crate::state::SubagentTarget,
     pub document: TranscriptDocument,
     pub scroll: usize,
+    pub max_scroll: usize,
     pub previous_selection: Option<TreeTarget>,
     pub previous_pane_scroll: usize,
 }
@@ -183,6 +184,13 @@ impl CapabilityUiState {
         }) {
             self.detail = None;
         }
+        if self.transcript.loading.as_ref().is_some_and(|request| {
+            !live_scopes.contains(&PaneScopeKey::from_subagent_target(&request.target))
+        }) || self.transcript.view.as_ref().is_some_and(|view| {
+            !live_scopes.contains(&PaneScopeKey::from_subagent_target(&view.target))
+        }) {
+            self.transcript = TranscriptUiState::default();
+        }
     }
 
     fn prune_unconfigured_providers(&mut self, configured_providers: &HashSet<String>) {
@@ -203,6 +211,19 @@ impl CapabilityUiState {
         }) {
             self.detail = None;
         }
+        if self
+            .transcript
+            .loading
+            .as_ref()
+            .is_some_and(|request| !configured_providers.contains(&request.target.provider_id))
+            || self
+                .transcript
+                .view
+                .as_ref()
+                .is_some_and(|view| !configured_providers.contains(&view.target.provider_id))
+        {
+            self.transcript = TranscriptUiState::default();
+        }
     }
 
     fn invalidate_missing_transient_targets(&mut self, key: &CacheKey, reply: &Reply) {
@@ -221,11 +242,34 @@ impl CapabilityUiState {
         }) {
             self.detail = None;
         }
+        if self.transcript.loading.as_ref().is_some_and(|request| {
+            request.target.matches_cache_key(key)
+                && !reply
+                    .agents
+                    .iter()
+                    .any(|agent| agent.id == request.target.agent_id)
+        }) || self.transcript.view.as_ref().is_some_and(|view| {
+            view.target.matches_cache_key(key)
+                && !reply
+                    .agents
+                    .iter()
+                    .any(|agent| agent.id == view.target.agent_id)
+        }) {
+            self.transcript = TranscriptUiState::default();
+        }
     }
 }
 
 impl PaneScopeKey {
     fn from_tree_target(target: &TreeTarget) -> Self {
+        Self {
+            provider_id: target.provider_id.clone(),
+            parent_pane_id: target.parent_pane_id.clone(),
+            session_id: target.session_id.clone(),
+        }
+    }
+
+    fn from_subagent_target(target: &crate::state::SubagentTarget) -> Self {
         Self {
             provider_id: target.provider_id.clone(),
             parent_pane_id: target.parent_pane_id.clone(),
@@ -273,6 +317,14 @@ impl TreeTarget {
             .tree
             .iter()
             .any(|node| node.agent_id == self.agent_id && node.id == self.node_id)
+    }
+}
+
+impl crate::state::SubagentTarget {
+    fn matches_cache_key(&self, key: &CacheKey) -> bool {
+        self.provider_id == key.provider
+            && self.parent_pane_id == key.pane_id
+            && self.session_id == key.session_id
     }
 }
 
@@ -503,6 +555,11 @@ impl ExtensionsState {
             })
             .collect();
         self.ui.prune_dead_scopes(&live_scopes);
+        if self.pending_native_open.as_ref().is_some_and(|pending| {
+            !live_scopes.contains(&PaneScopeKey::from_subagent_target(&pending.target))
+        }) {
+            self.pending_native_open = None;
+        }
         if self.last_refresh.elapsed() < Duration::from_secs(2) {
             return;
         }
@@ -637,6 +694,15 @@ impl ExtensionsState {
                 match result {
                     Ok(reply) => {
                         self.ui.reconcile_scope(key, reply);
+                        if self.pending_native_open.as_ref().is_some_and(|pending| {
+                            pending.target.matches_cache_key(key)
+                                && !reply
+                                    .agents
+                                    .iter()
+                                    .any(|agent| agent.id == pending.target.agent_id)
+                        }) {
+                            self.pending_native_open = None;
+                        }
                         self.cache.insert(
                             key.clone(),
                             Inspection {
@@ -696,11 +762,15 @@ impl ExtensionsState {
                 self.config_error = None;
                 self.cache.clear();
                 self.in_flight.clear();
+                self.ui.transcript = TranscriptUiState::default();
+                self.pending_native_open = None;
             }
             Err(error) => {
                 self.config = None;
                 self.cache.clear();
                 self.in_flight.clear();
+                self.ui.transcript = TranscriptUiState::default();
+                self.pending_native_open = None;
                 if self.config_path.exists() {
                     self.set_notice(error);
                 } else {

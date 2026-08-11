@@ -18,6 +18,11 @@ pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 pub const CAPABILITY_AGENT_LIFECYCLE_V1: &str = "agent_lifecycle_v1";
 pub const CAPABILITY_TRANSCRIPT_V1: &str = "transcript_v1";
 pub const CAPABILITY_ACTIVATION_OUTCOME_V1: &str = "activation_outcome_v1";
+pub const REQUEST_CAPABILITIES: &[&str] = &[
+    CAPABILITY_AGENT_LIFECYCLE_V1,
+    CAPABILITY_TRANSCRIPT_V1,
+    CAPABILITY_ACTIVATION_OUTCOME_V1,
+];
 const DEFAULT_TIMEOUT_MS: u64 = 750;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -58,6 +63,7 @@ fn default_timeout_ms() -> u64 {
 pub struct Request<'a> {
     pub version: u32,
     pub op: &'a str,
+    pub capabilities: &'a [&'a str],
     pub provider: &'a str,
     pub pane_id: &'a str,
     /// Canonical current directory reported by tmux for this pane. The
@@ -194,8 +200,14 @@ pub enum AgentLifecycle {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivationOutcome {
-    NativeOpened,
+    OpenedNative,
     TranscriptFallback,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Activation {
+    pub outcome: ActivationOutcome,
 }
 
 impl AgentRole {
@@ -264,9 +276,14 @@ pub struct Detail {
 /// diagnostic logs.
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TranscriptDocument {
+    pub agent_id: String,
     pub title: String,
     #[serde(default)]
-    pub source: String,
+    pub lifecycle: AgentLifecycle,
+    #[serde(default)]
+    pub truncated_before: bool,
+    #[serde(default)]
+    pub truncated_after: bool,
     pub items: Vec<TranscriptItem>,
 }
 
@@ -274,10 +291,20 @@ pub struct TranscriptDocument {
 /// without making the core interpret a provider-specific transcript format.
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TranscriptItem {
-    #[serde(default)]
-    pub role: String,
-    #[serde(alias = "content")]
+    pub kind: TranscriptItemKind,
     pub text: String,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptItemKind {
+    User,
+    Developer,
+    Assistant,
+    Reasoning,
+    ToolCall,
+    ToolResult,
+    Event,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default)]
@@ -291,9 +318,7 @@ pub struct Reply {
     pub agents: Vec<AgentNode>,
     pub tree: Vec<TreeNode>,
     pub detail: Option<Detail>,
-    /// Collector-advertised optional protocol features.
-    pub capabilities: Vec<String>,
-    pub activation_outcome: Option<ActivationOutcome>,
+    pub activation: Option<Activation>,
     pub transcript: Option<TranscriptDocument>,
 }
 
@@ -367,6 +392,7 @@ pub fn inspect(
     let request = Request {
         version: PROTOCOL_VERSION,
         op: "inspect",
+        capabilities: REQUEST_CAPABILITIES,
         provider,
         pane_id,
         cwd: None,
@@ -418,6 +444,7 @@ pub fn inspect_once(
         &Request {
             version: PROTOCOL_VERSION,
             op: "inspect",
+            capabilities: REQUEST_CAPABILITIES,
             provider,
             pane_id,
             cwd,
@@ -445,6 +472,7 @@ pub fn activate(
         &Request {
             version: PROTOCOL_VERSION,
             op: "activate",
+            capabilities: REQUEST_CAPABILITIES,
             provider: activation.provider,
             pane_id: activation.pane_id,
             cwd: activation.cwd,
@@ -471,6 +499,7 @@ pub fn transcript(
         &Request {
             version: PROTOCOL_VERSION,
             op: "transcript",
+            capabilities: REQUEST_CAPABILITIES,
             provider: request.provider,
             pane_id: request.pane_id,
             cwd: request.cwd,
@@ -480,16 +509,13 @@ pub fn transcript(
             subagent_id: Some(request.agent_id),
         },
     )?;
-    if !reply
-        .capabilities
-        .iter()
-        .any(|capability| capability == CAPABILITY_TRANSCRIPT_V1)
-    {
-        return Err("collector did not negotiate transcript_v1".to_string());
-    }
-    reply
+    let document = reply
         .transcript
-        .ok_or_else(|| "collector returned no transcript".to_string())
+        .ok_or_else(|| "collector returned no transcript".to_string())?;
+    if document.agent_id != request.agent_id {
+        return Err("collector transcript agent id does not match request".to_string());
+    }
+    Ok(document)
 }
 
 /// Load the text for one selected capability. `detail_token` must have come
@@ -512,6 +538,7 @@ pub fn detail(
         &Request {
             version: PROTOCOL_VERSION,
             op: "detail",
+            capabilities: REQUEST_CAPABILITIES,
             provider,
             pane_id,
             cwd,
@@ -683,24 +710,6 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
             return Err("invalid or duplicate agent id".into());
         }
     }
-    for capability in &reply.capabilities {
-        if !matches!(
-            capability.as_str(),
-            CAPABILITY_AGENT_LIFECYCLE_V1
-                | CAPABILITY_TRANSCRIPT_V1
-                | CAPABILITY_ACTIVATION_OUTCOME_V1
-        ) {
-            return Err("unknown collector capability".into());
-        }
-    }
-    if reply.activation_outcome.is_some()
-        && !reply
-            .capabilities
-            .iter()
-            .any(|capability| capability == CAPABILITY_ACTIVATION_OUTCOME_V1)
-    {
-        return Err("activation outcome was not negotiated".into());
-    }
     let parents: std::collections::HashMap<&str, Option<&str>> = reply
         .agents
         .iter()
@@ -840,20 +849,15 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
         return Err("invalid detail reply".into());
     }
     if let Some(transcript) = &reply.transcript {
-        if !reply
-            .capabilities
-            .iter()
-            .any(|capability| capability == CAPABILITY_TRANSCRIPT_V1)
+        if !valid(&transcript.agent_id)
+            || !agent_ids.contains(transcript.agent_id.as_str())
             || !valid(&transcript.title)
-            || (!transcript.source.is_empty() && !valid(&transcript.source))
             || transcript.items.len() > MAX_TRANSCRIPT_ITEMS
         {
             return Err("invalid transcript reply".into());
         }
         for item in &transcript.items {
-            if item.role.len() > MAX_TEXT
-                || !is_safe_text(&item.role)
-                || item.text.len() > MAX_TEXT
+            if item.text.len() > MAX_TEXT
                 || item
                     .text
                     .chars()
@@ -960,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_protocol_defaults_for_older_collectors_and_validates_negotiation() {
+    fn transcript_protocol_defaults_for_older_collectors_and_validates_wire_schema() {
         let legacy: Reply =
             serde_json::from_str(r#"{"version":1,"agents":[{"id":"child","label":"worker"}]}"#)
                 .unwrap();
@@ -969,7 +973,7 @@ mod tests {
         assert!(legacy.transcript.is_none());
 
         let reply: Reply = serde_json::from_str(
-            r#"{"version":1,"capabilities":["agent_lifecycle_v1","transcript_v1","activation_outcome_v1"],"agents":[{"id":"child","label":"worker","lifecycle":"completed","transcript_available":true}],"activation_outcome":"transcript_fallback","transcript":{"title":"Worker","items":[{"role":"assistant","content":"done"}]}}"#,
+            r#"{"version":1,"agents":[{"id":"child","label":"worker","lifecycle":"completed","transcript_available":true}],"activation":{"outcome":"transcript_fallback"},"transcript":{"agent_id":"child","title":"Worker","lifecycle":"completed","truncated_before":false,"truncated_after":true,"items":[{"kind":"assistant","text":"done"}]}}"#,
         )
         .unwrap();
         validate_reply(&reply).unwrap();
@@ -977,12 +981,34 @@ mod tests {
     }
 
     #[test]
-    fn transcript_without_negotiated_capability_is_rejected() {
+    fn transcript_requires_matching_agent_id() {
         let reply: Reply = serde_json::from_str(
-            r#"{"version":1,"transcript":{"title":"Worker","items":[{"text":"done"}]}}"#,
+            r#"{"version":1,"agents":[{"id":"child","label":"worker"}],"transcript":{"agent_id":"other","title":"Worker","items":[{"kind":"assistant","text":"done"}]}}"#,
         )
         .unwrap();
         assert!(validate_reply(&reply).unwrap_err().contains("transcript"));
+    }
+
+    #[test]
+    fn every_wire_operation_advertises_exact_v1_capabilities() {
+        for op in ["inspect", "detail", "activate", "transcript"] {
+            let encoded = serde_json::to_string(&Request {
+                version: PROTOCOL_VERSION,
+                op,
+                capabilities: REQUEST_CAPABILITIES,
+                provider: "claude",
+                pane_id: "%1",
+                cwd: None,
+                session_id: None,
+                pane_pid: None,
+                current_command: None,
+                subagent_id: None,
+            })
+            .unwrap();
+            assert!(encoded.contains(
+                "\"capabilities\":[\"agent_lifecycle_v1\",\"transcript_v1\",\"activation_outcome_v1\"]"
+            ));
+        }
     }
 
     #[cfg(unix)]
@@ -1101,6 +1127,7 @@ mod tests {
         let request = Request {
             version: PROTOCOL_VERSION,
             op: "inspect",
+            capabilities: REQUEST_CAPABILITIES,
             provider: "claude",
             pane_id: "%1",
             cwd: Some(cwd.to_str().unwrap()),
@@ -1194,7 +1221,7 @@ mod tests {
         let script = dir.path().join("collector");
         std::fs::write(
             &script,
-            "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in *'\"op\":\"transcript\"'*'\"pane_id\":\"%1\"'*'\"cwd\":\"/tmp/project\"'*'\"session_id\":\"session\"'*'\"pane_pid\":42'*'\"current_command\":\"claude\"'*'\"subagent_id\":\"child\"'*) ;; *) exit 7 ;; esac\nprintf '%s' '{\"version\":1,\"capabilities\":[\"transcript_v1\"],\"transcript\":{\"title\":\"Worker\",\"items\":[{\"role\":\"assistant\",\"text\":\"done\"}]}}'\n",
+            "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in *'\"op\":\"transcript\"'*'\"capabilities\":[\"agent_lifecycle_v1\",\"transcript_v1\",\"activation_outcome_v1\"]'*'\"pane_id\":\"%1\"'*'\"cwd\":\"/tmp/project\"'*'\"session_id\":\"session\"'*'\"pane_pid\":42'*'\"current_command\":\"claude\"'*'\"subagent_id\":\"child\"'*) ;; *) exit 7 ;; esac\nprintf '%s' '{\"version\":1,\"agents\":[{\"id\":\"child\",\"label\":\"worker\"}],\"transcript\":{\"agent_id\":\"child\",\"title\":\"Worker\",\"items\":[{\"kind\":\"assistant\",\"text\":\"done\"}]}}'\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();

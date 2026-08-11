@@ -95,6 +95,9 @@ pub struct FrameLayout {
     /// OSC 8 hyperlink overlays the main loop writes after each frame so
     /// terminals can recognise PR numbers as clickable links.
     pub hyperlink_overlays: Vec<HyperlinkOverlay>,
+    /// Full-sidebar transcript back affordance. Rewritten each transcript
+    /// frame and consumed before any normal pane click handling.
+    pub transcript_back_rect: Option<ratatui::layout::Rect>,
 }
 
 pub(super) fn point_in_rect(row: u16, col: u16, rect: ratatui::layout::Rect) -> bool {
@@ -223,6 +226,18 @@ impl AppState {
     /// via line_to_row (adjusted for scroll offset) and activates that pane.
     /// Row 0 is the fixed filter bar, row 1+ maps to the scrollable agent list.
     pub fn handle_mouse_click(&mut self, row: u16, col: u16) {
+        if self.extensions.ui.transcript.view.is_some()
+            || self.extensions.ui.transcript.loading.is_some()
+        {
+            if self
+                .layout
+                .transcript_back_rect
+                .is_some_and(|rect| point_in_rect(row, col, rect))
+            {
+                self.close_transcript();
+            }
+            return;
+        }
         if self.is_notices_popup_open() {
             if let Some(area) = self.notices_popup_area()
                 && point_in_rect(row, col, area)

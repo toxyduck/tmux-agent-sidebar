@@ -69,6 +69,7 @@ pub fn show_ports_from_tmux() -> bool {
 
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
     state.layout.hyperlink_overlays.clear();
+    state.layout.transcript_back_rect = None;
     let area = frame.area();
 
     if state.extensions.ui.transcript.view.is_some()

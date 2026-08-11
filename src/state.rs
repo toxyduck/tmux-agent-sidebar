@@ -264,14 +264,6 @@ impl AppState {
             )
             .is_some_and(|inspection| {
                 !inspection.stale
-                    && inspection.reply.capabilities.iter().any(|capability| {
-                        capability == crate::extension::CAPABILITY_AGENT_LIFECYCLE_V1
-                    })
-                    && inspection
-                        .reply
-                        .capabilities
-                        .iter()
-                        .any(|capability| capability == crate::extension::CAPABILITY_TRANSCRIPT_V1)
                     && inspection.reply.agents.iter().any(|agent| {
                         agent.id == target.agent_id
                             && agent.parent_id.is_some()
@@ -314,7 +306,22 @@ impl AppState {
         if delta.is_negative() {
             view.scroll = view.scroll.saturating_sub(delta.unsigned_abs());
         } else {
-            view.scroll = view.scroll.saturating_add(delta as usize);
+            view.scroll = view
+                .scroll
+                .saturating_add(delta as usize)
+                .min(view.max_scroll);
+        }
+    }
+
+    pub fn scroll_transcript_to_start(&mut self) {
+        if let Some(view) = self.extensions.ui.transcript.view.as_mut() {
+            view.scroll = 0;
+        }
+    }
+
+    pub fn scroll_transcript_to_end(&mut self) {
+        if let Some(view) = self.extensions.ui.transcript.view.as_mut() {
+            view.scroll = view.max_scroll;
         }
     }
     pub fn new(tmux_pane: String) -> Self {
@@ -461,15 +468,9 @@ impl AppState {
                     match result {
                         Ok(reply)
                             if reply.error.is_none()
-                                && reply.activation_outcome
-                                    == Some(
-                                        crate::extension::ActivationOutcome::TranscriptFallback,
-                                    )
-                                && reply.capabilities.iter().any(|capability| {
-                                    capability == crate::extension::CAPABILITY_ACTIVATION_OUTCOME_V1
-                                })
-                                && reply.capabilities.iter().any(|capability| {
-                                    capability == crate::extension::CAPABILITY_TRANSCRIPT_V1
+                                && reply.activation.as_ref().is_some_and(|activation| {
+                                    activation.outcome
+                                        == crate::extension::ActivationOutcome::TranscriptFallback
                                 }) =>
                         {
                             let (_, cwd, pane_pid, current_command) =
@@ -500,16 +501,25 @@ impl AppState {
                             target: request.target,
                             document,
                             scroll: 0,
+                            max_scroll: 0,
                             previous_selection: request.previous_selection,
                             previous_pane_scroll: request.previous_pane_scroll,
                         });
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if self.extensions.ui.transcript.loading.as_ref() == Some(&request) {
+                            self.extensions.ui.transcript.loading = None;
+                        }
+                    }
                     Err(error) if self.accepts_transcript(&request) => {
                         self.extensions.ui.transcript.loading = None;
                         self.set_flash(format!("Transcript unavailable: {error}"));
                     }
-                    Err(_) => {}
+                    Err(_) => {
+                        if self.extensions.ui.transcript.loading.as_ref() == Some(&request) {
+                            self.extensions.ui.transcript.loading = None;
+                        }
+                    }
                 },
             }
         }

@@ -8,12 +8,19 @@ pub struct RowTarget {
 
 /// A child displayed under a parent pane. Every identifier comes from the
 /// provider reply; no activation is resolved from text or a row index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentTarget {
     pub parent_pane_id: String,
     pub provider_id: String,
     pub agent_id: String,
     pub node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NavigationTarget {
+    Pane { row: usize },
+    Subagent(SubagentTarget),
+    Tree(TreeTarget),
 }
 
 /// Click target for the `+` button rendered at the right edge of each
@@ -65,6 +72,7 @@ pub struct FrameLayout {
     /// Agent and capability tree lines rendered for the selected pane.
     /// Stable `node_id` makes duplicate labels safe to select and disclose.
     pub tree_line_targets: HashMap<usize, TreeTarget>,
+    pub navigation_targets: Vec<NavigationTarget>,
     /// X column of the repo filter button in the secondary header. `None`
     /// when the button is hidden. Used for click hit-testing.
     pub repo_button_col: Option<u16>,
@@ -289,6 +297,7 @@ impl AppState {
 
         let line_index = (row as usize - 2) + self.scrolls.panes.offset;
         if let Some(target) = self.layout.tree_line_targets.get(&line_index).cloned() {
+            self.selected_navigation_target = Some(NavigationTarget::Tree(target.clone()));
             if target.is_disclosure {
                 self.extensions.ui.toggle(&target);
             } else {
@@ -298,15 +307,15 @@ impl AppState {
         }
         if let Some(target) = self.layout.subagent_line_targets.get(&line_index).cloned() {
             self.selected_subagent_target = Some(target.clone());
-            self.activate_subagent(target);
+            self.selected_navigation_target = Some(NavigationTarget::Subagent(target));
             return;
         }
         if let Some(Some(agent_row)) = self.layout.line_to_row.get(line_index) {
             self.global.selected_pane_row = *agent_row;
             self.extensions.ui.selected = None;
             self.selected_subagent_target = None;
+            self.selected_navigation_target = Some(NavigationTarget::Pane { row: *agent_row });
             self.global.queue_cursor_save();
-            self.activate_selected_pane();
         }
     }
 }

@@ -29,11 +29,13 @@ pub(super) use branch::sidebar_remove_marker_col;
 
 /// Render collector facts below an agent row. Facts are data, not UI code:
 /// configuration may hide/reorder them and built-ins collapse to one muted row.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_extension_tree(
     inspection: Option<&crate::extension::Inspection>,
     config: Option<&crate::extension::ExtensionsConfig>,
     pane_id: &str,
     provider_id: &str,
+    selected_agent_id: Option<&str>,
     ui: &CapabilityUiState,
     width: usize,
     theme: &ColorTheme,
@@ -42,12 +44,12 @@ pub(super) fn render_extension_tree(
         return Vec::new();
     };
     let mut facts = inspection.reply.facts.clone();
-    facts.retain(|fact| !config.hidden_rows.iter().any(|hidden| hidden == &fact.id));
+    facts.retain(|fact| !is_hidden(config, fact_category(fact)));
     facts.sort_by_key(|fact| {
         config
             .row_order
             .iter()
-            .position(|id| id == &fact.id)
+            .position(|id| id == fact_category(fact))
             .unwrap_or(usize::MAX)
     });
     let ctx = RowCtx {
@@ -73,6 +75,7 @@ pub(super) fn render_extension_tree(
         .find(|agent| agent.parent_id.is_none())
         .map(|agent| agent.id.clone())
         .unwrap_or_else(|| pane_id.to_string());
+    let selected_agent_id = selected_agent_id.unwrap_or(&default_agent_id);
     let mut lines = Vec::new();
     let fact_line = |fact: &crate::extension::Fact, indent: usize| {
         let marker = match fact.evidence {
@@ -102,9 +105,20 @@ pub(super) fn render_extension_tree(
         (line, target)
     };
 
+    let mut nodes: Vec<_> = inspection
+        .reply
+        .tree
+        .iter()
+        .filter(|node| {
+            node.agent_id == selected_agent_id
+                && !is_hidden(config, node.category.as_deref().unwrap_or("core"))
+        })
+        .collect();
+    nodes.sort_by_key(|node| category_rank(config, node.category.as_deref().unwrap_or("core")));
+
     // A root TreeNode is visible by default. Descendants require an explicit
     // disclosure state, so a dense collector cannot flood the sidebar.
-    for node in &inspection.reply.tree {
+    for node in nodes {
         let mut ancestors = Vec::new();
         let mut parent = node.parent_id.as_deref();
         let mut seen = HashSet::new();
@@ -124,11 +138,10 @@ pub(super) fn render_extension_tree(
         {
             continue;
         }
-        let has_children = inspection
-            .reply
-            .tree
-            .iter()
-            .any(|candidate| candidate.parent_id.as_deref() == Some(node.id.as_str()));
+        let has_children = inspection.reply.tree.iter().any(|candidate| {
+            candidate.agent_id == selected_agent_id
+                && candidate.parent_id.as_deref() == Some(node.id.as_str())
+        });
         let has_content = has_children || !node.fact_ids.is_empty();
         let expanded = ui.is_expanded(pane_id, &node.id);
         let disclosure = if has_content {
@@ -177,9 +190,9 @@ pub(super) fn render_extension_tree(
         .reply
         .builtins
         .iter()
-        .filter(|fact| !config.hidden_rows.iter().any(|hidden| hidden == &fact.id))
+        .filter(|fact| !is_hidden(config, fact_category(fact)))
         .collect();
-    if !builtins.is_empty() && !config.hidden_rows.iter().any(|hidden| hidden == "builtins") {
+    if !builtins.is_empty() && !is_hidden(config, "builtins") {
         let builtins_id = "__builtins__";
         let expanded = ui.is_expanded(pane_id, builtins_id);
         let exceptions = builtins
@@ -224,18 +237,11 @@ pub(super) fn render_extension_tree(
             }
         }
     }
-    let mut slots: Vec<_> = config
+    let slots: Vec<_> = config
         .slots
         .iter()
-        .filter(|slot| !config.hidden_rows.iter().any(|hidden| hidden == &slot.id))
+        .filter(|_| !is_hidden(config, "slots"))
         .collect();
-    slots.sort_by_key(|slot| {
-        config
-            .row_order
-            .iter()
-            .position(|id| id == &slot.id)
-            .unwrap_or(usize::MAX)
-    });
     for slot in slots {
         if let Some(value) = inspection.reply.slots.get(&slot.id) {
             let text = truncate_to_width(&format!("  {}: {value}", slot.title), ctx.inner_width);
@@ -291,6 +297,29 @@ pub(super) fn render_extension_tree(
         ));
     }
     lines
+}
+
+fn fact_category(fact: &crate::extension::Fact) -> &str {
+    fact.category.as_deref().unwrap_or(match fact.id.as_str() {
+        "model" => "model",
+        "instructions" => "instructions",
+        "skills" => "skills",
+        "mcp" => "mcp",
+        "tools" => "tools",
+        _ => "core",
+    })
+}
+
+fn is_hidden(config: &crate::extension::ExtensionsConfig, category: &str) -> bool {
+    config.hidden_rows.iter().any(|hidden| hidden == category)
+}
+
+fn category_rank(config: &crate::extension::ExtensionsConfig, category: &str) -> usize {
+    config
+        .row_order
+        .iter()
+        .position(|configured| configured == category)
+        .unwrap_or(usize::MAX)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -370,7 +399,9 @@ pub(super) fn render_pane_lines_with_ports(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extension::{Evidence, ExtensionsConfig, Fact, Inspection, Reply, TreeNode};
+    use crate::extension::{
+        AgentNode, Evidence, ExtensionsConfig, Fact, Inspection, Reply, TreeNode,
+    };
     use crate::group::PaneGitInfo;
     use crate::state::CapabilityUiState;
     use crate::tmux::{AgentType, PaneInfo, PermissionMode, WorktreeMetadata};
@@ -432,6 +463,7 @@ mod tests {
                         evidence: Evidence::Available,
                         source: String::new(),
                         detail_token: Some("token-a".into()),
+                        category: Some("skills".into()),
                     },
                     Fact {
                         id: "skill-b".into(),
@@ -440,6 +472,7 @@ mod tests {
                         evidence: Evidence::Available,
                         source: String::new(),
                         detail_token: Some("token-b".into()),
+                        category: Some("skills".into()),
                     },
                 ],
                 builtins: vec![Fact {
@@ -449,13 +482,16 @@ mod tests {
                     evidence: Evidence::Available,
                     source: String::new(),
                     detail_token: None,
+                    category: None,
                 }],
                 tree: vec![TreeNode {
                     id: "skills".into(),
+                    agent_id: "agent-1".into(),
                     parent_id: None,
                     label: "Skills".into(),
                     fact_ids: vec!["skill-a".into(), "skill-b".into()],
                     detail_token: None,
+                    category: Some("skills".into()),
                 }],
                 ..Reply::default()
             },
@@ -470,6 +506,7 @@ mod tests {
             }),
             "%1",
             "claude",
+            Some("agent-1"),
             &ui,
             18,
             &theme,
@@ -495,6 +532,7 @@ mod tests {
             }),
             "%1",
             "claude",
+            Some("agent-1"),
             &ui,
             18,
             &theme,
@@ -505,6 +543,69 @@ mod tests {
             .collect();
         assert!(ids.contains(&"fact:skill-a"));
         assert!(ids.contains(&"fact:skill-b"));
+    }
+
+    #[test]
+    fn extension_tree_only_renders_the_selected_subagent_capabilities() {
+        let inspection = Inspection {
+            stale: false,
+            reply: Reply {
+                version: 1,
+                agents: vec![
+                    AgentNode {
+                        id: "root".into(),
+                        parent_id: None,
+                        label: "root".into(),
+                        model: None,
+                    },
+                    AgentNode {
+                        id: "child".into(),
+                        parent_id: Some("root".into()),
+                        label: "child".into(),
+                        model: None,
+                    },
+                ],
+                tree: vec![
+                    TreeNode {
+                        id: "root-skill".into(),
+                        agent_id: "root".into(),
+                        parent_id: None,
+                        label: "root capability".into(),
+                        fact_ids: vec![],
+                        detail_token: None,
+                        category: Some("skills".into()),
+                    },
+                    TreeNode {
+                        id: "child-skill".into(),
+                        agent_id: "child".into(),
+                        parent_id: None,
+                        label: "child capability".into(),
+                        fact_ids: vec![],
+                        detail_token: None,
+                        category: Some("skills".into()),
+                    },
+                ],
+                ..Reply::default()
+            },
+        };
+        let lines = render_extension_tree(
+            Some(&inspection),
+            Some(&ExtensionsConfig {
+                version: 1,
+                ..ExtensionsConfig::default()
+            }),
+            "%1",
+            "claude",
+            Some("child"),
+            &CapabilityUiState::default(),
+            18,
+            &ColorTheme::default(),
+        );
+        let ids: Vec<_> = lines
+            .into_iter()
+            .map(|(_, target)| target.node_id)
+            .collect();
+        assert_eq!(ids, vec!["child-skill"]);
     }
 
     fn test_ctx<'a>(theme: &'a ColorTheme, inner_width: usize, active: bool) -> RowCtx<'a> {

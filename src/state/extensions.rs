@@ -78,12 +78,14 @@ enum WorkerRequest {
     Detail {
         target: TreeTarget,
         session_id: Option<String>,
+        cwd: Option<String>,
         previous_pane_scroll: usize,
         config: ExtensionsConfig,
     },
     Activate {
         target: crate::state::SubagentTarget,
         session_id: Option<String>,
+        cwd: Option<String>,
         config: ExtensionsConfig,
     },
 }
@@ -110,7 +112,8 @@ pub struct ExtensionsState {
     config_mtime: Option<SystemTime>,
     cache: HashMap<CacheKey, Inspection>,
     in_flight: HashSet<CacheKey>,
-    tx: SyncSender<WorkerRequest>,
+    inspect_tx: SyncSender<WorkerRequest>,
+    control_tx: SyncSender<WorkerRequest>,
     rx: Receiver<WorkerResult>,
     last_refresh: Instant,
     pub ui: CapabilityUiState,
@@ -121,9 +124,14 @@ impl ExtensionsState {
         let config_path = crate::tmux::get_option(crate::tmux::SIDEBAR_EXTENSIONS_CONFIG)
             .map(PathBuf::from)
             .unwrap_or_else(extension::default_config_path);
-        let (tx, worker_rx) = mpsc::sync_channel(32);
+        let (inspect_tx, inspect_rx) = mpsc::sync_channel(32);
+        let (control_tx, control_rx) = mpsc::sync_channel(8);
         let (worker_tx, rx) = mpsc::channel();
-        std::thread::spawn(move || worker_loop(worker_rx, worker_tx));
+        std::thread::spawn({
+            let worker_tx = worker_tx.clone();
+            move || worker_loop(inspect_rx, worker_tx)
+        });
+        std::thread::spawn(move || worker_loop(control_rx, worker_tx));
         let mut state = Self {
             config: None,
             config_error: None,
@@ -131,7 +139,8 @@ impl ExtensionsState {
             config_mtime: None,
             cache: HashMap::new(),
             in_flight: HashSet::new(),
-            tx,
+            inspect_tx,
+            control_tx,
             rx,
             last_refresh: Instant::now() - Duration::from_secs(2),
             ui: CapabilityUiState::default(),
@@ -167,7 +176,7 @@ impl ExtensionsState {
             if self.in_flight.contains(&key) {
                 continue;
             }
-            match self.tx.try_send(WorkerRequest::Inspect {
+            match self.inspect_tx.try_send(WorkerRequest::Inspect {
                 key: key.clone(),
                 cwd,
                 config: config.clone(),
@@ -185,16 +194,18 @@ impl ExtensionsState {
         &mut self,
         target: TreeTarget,
         session_id: Option<String>,
+        cwd: Option<String>,
         previous_pane_scroll: usize,
     ) -> Result<(), String> {
         let config = self
             .config
             .clone()
             .ok_or_else(|| "no provider collector configured".to_string())?;
-        self.tx
+        self.control_tx
             .try_send(WorkerRequest::Detail {
                 target,
                 session_id,
+                cwd,
                 previous_pane_scroll,
                 config,
             })
@@ -208,15 +219,17 @@ impl ExtensionsState {
         &mut self,
         target: crate::state::SubagentTarget,
         session_id: Option<String>,
+        cwd: Option<String>,
     ) -> Result<(), String> {
         let config = self
             .config
             .clone()
             .ok_or_else(|| "no provider collector configured".to_string())?;
-        self.tx
+        self.control_tx
             .try_send(WorkerRequest::Activate {
                 target,
                 session_id,
+                cwd,
                 config,
             })
             .map_err(|error| match error {
@@ -313,6 +326,7 @@ fn worker_loop(rx: Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerResult>) {
             WorkerRequest::Detail {
                 target,
                 session_id,
+                cwd,
                 previous_pane_scroll,
                 config,
             } => WorkerResult::Detail {
@@ -323,6 +337,7 @@ fn worker_loop(rx: Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerResult>) {
                             &config,
                             &target.provider_id,
                             &target.parent_pane_id,
+                            cwd.as_deref(),
                             session_id.as_deref(),
                             token,
                         )
@@ -334,12 +349,14 @@ fn worker_loop(rx: Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerResult>) {
             WorkerRequest::Activate {
                 target,
                 session_id,
+                cwd,
                 config,
             } => WorkerResult::Activate {
                 result: extension::activate(
                     &config,
                     &target.provider_id,
                     &target.parent_pane_id,
+                    cwd.as_deref(),
                     session_id.as_deref(),
                     &target.agent_id,
                 ),

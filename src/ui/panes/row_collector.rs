@@ -167,6 +167,20 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                     state.extensions.config.as_ref(),
                     &pane.pane_id,
                     pane.agent.as_str(),
+                    state
+                        .selected_subagent_target
+                        .as_ref()
+                        .filter(|target| target.parent_pane_id == pane.pane_id)
+                        .map(|target| target.agent_id.as_str())
+                        .or_else(|| {
+                            state
+                                .extensions
+                                .ui
+                                .selected
+                                .as_ref()
+                                .filter(|target| target.parent_pane_id == pane.pane_id)
+                                .map(|target| target.agent_id.as_str())
+                        }),
                     &state.extensions.ui,
                     width,
                     theme,

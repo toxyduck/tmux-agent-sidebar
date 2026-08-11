@@ -512,6 +512,23 @@ pub fn draw_agents(frame: &mut Frame, state: &mut AppState, area: Rect) {
         })
         .collect();
     state.layout.tree_line_targets = pending_tree.into_iter().collect();
+    let mut seen_panes = std::collections::HashSet::new();
+    state.layout.navigation_targets = (0..lines.len())
+        .filter_map(|line| {
+            if let Some(target) = state.layout.subagent_line_targets.get(&line) {
+                return Some(crate::state::NavigationTarget::Subagent(target.clone()));
+            }
+            if let Some(target) = state.layout.tree_line_targets.get(&line) {
+                return Some(crate::state::NavigationTarget::Tree(target.clone()));
+            }
+            match state.layout.line_to_row.get(line).copied().flatten() {
+                Some(row) if seen_panes.insert(row) => {
+                    Some(crate::state::NavigationTarget::Pane { row })
+                }
+                _ => None,
+            }
+        })
+        .collect();
     let scroll_offset = compute_scroll_offset(state, lines.len(), layout.list_area);
     click_targets::materialize(
         state,

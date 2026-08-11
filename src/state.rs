@@ -25,7 +25,8 @@ pub use filter::{RepoFilter, StatusFilter};
 pub use focus::{Focus, FocusState};
 pub use global::GlobalState;
 pub use layout::{
-    FrameLayout, HyperlinkOverlay, RepoSpawnTarget, RowTarget, SpawnRemoveTarget, SubagentTarget,
+    FrameLayout, HyperlinkOverlay, NavigationTarget, RepoSpawnTarget, RowTarget, SpawnRemoveTarget,
+    SubagentTarget,
 };
 pub(crate) use notices::debug_forced_display;
 pub use notices::{ClaudePluginNotice, NoticesCopyTarget, NoticesMissingHookGroup, NoticesState};
@@ -73,6 +74,7 @@ pub struct AppState {
     /// Exact child selected in the tree. `Enter` reuses this same target as a
     /// mouse click; it is cleared whenever the pane list is rebuilt.
     pub selected_subagent_target: Option<SubagentTarget>,
+    pub selected_navigation_target: Option<NavigationTarget>,
     /// Periodic-refresh clocks (port scan, session-name scan, filter
     /// debounce, port-scan first-run flag).
     pub timers: RefreshTimers,
@@ -150,10 +152,8 @@ impl AppState {
     /// provider collector to open its native viewer. No pane/session is made.
     pub fn activate_subagent(&mut self, target: SubagentTarget) {
         crate::tmux::select_pane(&target.parent_pane_id);
-        let session_id = self
-            .pane_by_id(&target.parent_pane_id)
-            .and_then(|pane| pane.session_id.clone());
-        if let Err(error) = self.extensions.queue_activate(target, session_id) {
+        let (session_id, cwd) = self.pane_context(&target.parent_pane_id);
+        if let Err(error) = self.extensions.queue_activate(target, session_id, cwd) {
             self.set_flash(format!("Native viewer unavailable: {error}"));
         }
     }
@@ -167,15 +167,25 @@ impl AppState {
         let Some(_) = target.detail_token.as_deref() else {
             return;
         };
-        let session_id = self
-            .pane_by_id(&target.parent_pane_id)
-            .and_then(|pane| pane.session_id.clone());
+        let (session_id, cwd) = self.pane_context(&target.parent_pane_id);
         if let Err(error) =
             self.extensions
-                .queue_detail(target, session_id, self.scrolls.panes.offset)
+                .queue_detail(target, session_id, cwd, self.scrolls.panes.offset)
         {
             self.set_flash(format!("Detail unavailable: {error}"));
         }
+    }
+
+    fn pane_context(&self, pane_id: &str) -> (Option<String>, Option<String>) {
+        let Some(pane) = self.pane_by_id(pane_id) else {
+            return (None, None);
+        };
+        (
+            pane.session_id.clone(),
+            std::fs::canonicalize(&pane.path)
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned()),
+        )
     }
 
     pub fn close_capability_detail(&mut self) {
@@ -213,6 +223,7 @@ impl AppState {
             pane_states: PaneRuntimeMap::new(),
             extensions: ExtensionsState::load(),
             selected_subagent_target: None,
+            selected_navigation_target: None,
             timers: RefreshTimers::default(),
             popup: PopupState::None,
             notices: NoticesState::default(),
@@ -244,6 +255,42 @@ impl AppState {
         };
         crate::state::pet::reseed_pet_idle_motion(&mut state);
         state
+    }
+}
+
+impl AppState {
+    pub fn move_navigation(&mut self, delta: isize) -> bool {
+        let targets = &self.layout.navigation_targets;
+        if targets.is_empty() {
+            return false;
+        }
+        let current = self.selected_navigation_target.as_ref().and_then(|target| {
+            targets.iter().position(|candidate| candidate == target)
+        }).unwrap_or_else(|| {
+            targets.iter().position(|target| matches!(target, NavigationTarget::Pane { row } if *row == self.global.selected_pane_row)).unwrap_or(0)
+        });
+        let next = current as isize + delta;
+        if !(0..targets.len() as isize).contains(&next) {
+            return false;
+        }
+        let target = targets[next as usize].clone();
+        match &target {
+            NavigationTarget::Pane { row } => {
+                self.global.selected_pane_row = *row;
+                self.selected_subagent_target = None;
+                self.extensions.ui.selected = None;
+            }
+            NavigationTarget::Subagent(subagent) => {
+                self.selected_subagent_target = Some(subagent.clone());
+                self.extensions.ui.selected = None;
+            }
+            NavigationTarget::Tree(tree) => {
+                self.selected_subagent_target = None;
+                self.extensions.ui.selected = Some(tree.clone());
+            }
+        }
+        self.selected_navigation_target = Some(target);
+        true
     }
 }
 

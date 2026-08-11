@@ -158,19 +158,20 @@ pub(super) fn handle_key_event(
         }
         KeyCode::Enter => {
             if state.focus_state.focus == Focus::Panes {
-                if state
-                    .extensions
-                    .ui
-                    .selected
-                    .as_ref()
-                    .and_then(|target| target.detail_token.as_ref())
-                    .is_some()
-                {
-                    state.open_selected_capability_detail();
-                } else if let Some(target) = state.selected_subagent_target.clone() {
-                    state.activate_subagent(target);
-                } else {
-                    state.activate_selected_pane();
+                match state.selected_navigation_target.clone() {
+                    Some(crate::state::NavigationTarget::Tree(target)) => {
+                        if target.is_disclosure {
+                            state.extensions.ui.toggle(&target);
+                        } else if target.detail_token.is_some() {
+                            state.open_selected_capability_detail();
+                        }
+                    }
+                    Some(crate::state::NavigationTarget::Subagent(target)) => {
+                        state.activate_subagent(target);
+                    }
+                    Some(crate::state::NavigationTarget::Pane { .. }) | None => {
+                        state.activate_selected_pane();
+                    }
                 }
             }
         }
@@ -202,7 +203,12 @@ fn pane_nav_down(state: &mut AppState) {
             state.focus_state.focus = Focus::Panes;
         }
         Focus::Panes => {
-            if state.move_pane_selection(1) {
+            let moved = if state.layout.navigation_targets.is_empty() {
+                state.move_pane_selection(1)
+            } else {
+                state.move_navigation(1)
+            };
+            if moved {
                 state.global.queue_cursor_save();
             } else {
                 state.focus_state.focus = Focus::ActivityLog;
@@ -216,7 +222,12 @@ fn pane_nav_up(state: &mut AppState) {
     match state.focus_state.focus {
         Focus::Filter => {}
         Focus::Panes => {
-            if state.move_pane_selection(-1) {
+            let moved = if state.layout.navigation_targets.is_empty() {
+                state.move_pane_selection(-1)
+            } else {
+                state.move_navigation(-1)
+            };
+            if moved {
                 state.global.queue_cursor_save();
             } else {
                 state.focus_state.focus = Focus::Filter;
@@ -255,7 +266,7 @@ fn repo_popup_nav_up(state: &mut AppState) {
 mod tests {
     use super::*;
     use crate::group::RepoGroup;
-    use crate::state::RowTarget;
+    use crate::state::{NavigationTarget, RowTarget, SubagentTarget, TreeTarget};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -336,6 +347,49 @@ mod tests {
         assert_eq!(state.global.selected_pane_row, 1);
         handle_key_event(key(KeyCode::Char('k')), &mut state, &flag);
         assert_eq!(state.global.selected_pane_row, 0);
+    }
+
+    #[test]
+    fn pane_navigation_uses_the_same_stable_targets_as_clicks() {
+        let mut state = state_with_three_panes();
+        let subagent = SubagentTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            agent_id: "child".into(),
+            node_id: "child".into(),
+        };
+        let capability = TreeTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            agent_id: "child".into(),
+            node_id: "skill-a".into(),
+            detail_token: Some("detail-a".into()),
+            is_disclosure: false,
+        };
+        state.layout.navigation_targets = vec![
+            NavigationTarget::Pane { row: 0 },
+            NavigationTarget::Subagent(subagent.clone()),
+            NavigationTarget::Tree(capability.clone()),
+            NavigationTarget::Pane { row: 1 },
+        ];
+        state.selected_navigation_target = Some(NavigationTarget::Pane { row: 0 });
+        let flag = AtomicBool::new(false);
+
+        handle_key_event(key(KeyCode::Char('j')), &mut state, &flag);
+        assert_eq!(
+            state.selected_navigation_target,
+            Some(NavigationTarget::Subagent(subagent))
+        );
+        handle_key_event(key(KeyCode::Down), &mut state, &flag);
+        assert_eq!(
+            state.selected_navigation_target,
+            Some(NavigationTarget::Tree(capability))
+        );
+        handle_key_event(key(KeyCode::Char('k')), &mut state, &flag);
+        assert!(matches!(
+            state.selected_navigation_target,
+            Some(NavigationTarget::Subagent(_))
+        ));
     }
 
     #[test]

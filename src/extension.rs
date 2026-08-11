@@ -39,6 +39,10 @@ pub struct ProviderConfig {
     pub argv: Vec<String>,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// Explicit provider connection settings. The child receives no ambient
+    /// secrets; only these allowlisted variables are forwarded.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -82,6 +86,10 @@ pub struct Fact {
     /// It is deliberately not interpreted as a filesystem path by the UI.
     #[serde(default)]
     pub detail_token: Option<String>,
+    /// Stable semantic category (for example `model`, `skills`, `mcp`).
+    /// It is distinct from the dynamic provider fact ID.
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 /// Provider-neutral identity. `id` is stable within `(provider, session_id)`;
@@ -101,6 +109,8 @@ pub struct AgentNode {
 #[serde(deny_unknown_fields)]
 pub struct TreeNode {
     pub id: String,
+    /// The explicit provider AgentNode this capability belongs to.
+    pub agent_id: String,
     #[serde(default)]
     pub parent_id: Option<String>,
     pub label: String,
@@ -109,6 +119,8 @@ pub struct TreeNode {
     /// Optional provider-owned token for details attached directly to this node.
     #[serde(default)]
     pub detail_token: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 /// Complete text returned by a `detail` request. It is rendered inline by the
@@ -166,6 +178,18 @@ pub fn load_config(path: &Path) -> Result<ExtensionsConfig, String> {
             return Err("provider argv must contain an executable".into());
         }
         validate_executable(&provider.argv[0])?;
+        for (name, value) in &provider.env {
+            if !matches!(
+                name.as_str(),
+                "OPENCODE_SERVER_URL"
+                    | "OPENCODE_SERVER"
+                    | "OPENAI_BASE_URL"
+                    | "ANTHROPIC_BASE_URL"
+            ) || !is_safe_text(value)
+            {
+                return Err("invalid provider environment setting".into());
+            }
+        }
     }
     let mut slot_ids = std::collections::HashSet::new();
     for slot in &config.slots {
@@ -256,6 +280,7 @@ pub fn activate(
     config: &ExtensionsConfig,
     provider: &str,
     pane_id: &str,
+    cwd: Option<&str>,
     session_id: Option<&str>,
     subagent_id: &str,
 ) -> Result<Reply, String> {
@@ -270,7 +295,7 @@ pub fn activate(
             op: "activate",
             provider,
             pane_id,
-            cwd: None,
+            cwd,
             session_id,
             subagent_id: Some(subagent_id),
         },
@@ -284,6 +309,7 @@ pub fn detail(
     config: &ExtensionsConfig,
     provider: &str,
     pane_id: &str,
+    cwd: Option<&str>,
     session_id: Option<&str>,
     detail_token: &str,
 ) -> Result<Detail, String> {
@@ -298,7 +324,7 @@ pub fn detail(
             op: "detail",
             provider,
             pane_id,
-            cwd: None,
+            cwd,
             session_id,
             subagent_id: Some(detail_token),
         },
@@ -343,6 +369,9 @@ fn call(provider: &ProviderConfig, request: &Request<'_>) -> Result<Reply, Strin
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }
+    }
+    for (name, value) in &provider.env {
+        command.env(name, value);
     }
     #[cfg(unix)]
     {
@@ -431,6 +460,10 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
             || !valid(&fact.label)
             || !fact.detail.is_empty() && (!valid(&fact.detail))
             || !fact.source.is_empty() && (!valid(&fact.source))
+            || fact
+                .category
+                .as_deref()
+                .is_some_and(|category| !valid(category))
             || !fact_ids.insert(fact.id.as_str())
         {
             return Err("invalid or duplicate fact id".into());
@@ -442,7 +475,15 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
         }
     }
     for node in &reply.agents {
-        if !valid(&node.id) || !valid(&node.label) || !ids.insert(node.id.as_str()) {
+        if !valid(&node.id)
+            || !valid(&node.label)
+            || node.model.as_deref().is_some_and(|model| !valid(model))
+            || node
+                .parent_id
+                .as_deref()
+                .is_some_and(|parent| !valid(parent))
+            || !ids.insert(node.id.as_str())
+        {
             return Err("invalid or duplicate agent id".into());
         }
     }
@@ -471,7 +512,19 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
         }
     }
     for node in &reply.tree {
-        if !valid(&node.id) || !valid(&node.label) || !ids.insert(node.id.as_str()) {
+        if !valid(&node.id)
+            || !valid(&node.agent_id)
+            || !valid(&node.label)
+            || node
+                .parent_id
+                .as_deref()
+                .is_some_and(|parent| !valid(parent))
+            || node
+                .category
+                .as_deref()
+                .is_some_and(|category| !valid(category))
+            || !ids.insert(node.id.as_str())
+        {
             return Err("invalid or duplicate tree id".into());
         }
         if let Some(token) = &node.detail_token
@@ -504,6 +557,18 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
         {
             return Err("invalid capability tree parent".into());
         }
+        if let Some(parent) = &node.parent_id
+            && reply
+                .tree
+                .iter()
+                .find(|candidate| candidate.id == *parent)
+                .is_some_and(|parent| parent.agent_id != node.agent_id)
+        {
+            return Err("capability tree parent belongs to another agent".into());
+        }
+        if !agent_ids.contains(node.agent_id.as_str()) {
+            return Err("invalid capability agent id".into());
+        }
     }
     if let Some(detail) = &reply.detail
         && (!valid(&detail.title)
@@ -515,6 +580,11 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
             || (!detail.source.is_empty() && !valid(&detail.source)))
     {
         return Err("invalid detail reply".into());
+    }
+    if let Some(error) = &reply.error
+        && !valid(error)
+    {
+        return Err("invalid collector error".into());
     }
     Ok(())
 }
@@ -608,6 +678,7 @@ mod tests {
                 ProviderConfig {
                     argv: vec![script.to_string_lossy().into_owned()],
                     timeout_ms: 100,
+                    env: BTreeMap::new(),
                 },
             )]),
             ..ExtensionsConfig::default()
@@ -623,6 +694,46 @@ mod tests {
         assert_eq!(reply.facts[0].id, "model");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn detail_request_keeps_selected_pane_context() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("collector");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in *'\"op\":\"detail\"'*'\"cwd\":\"/tmp/project\"'*'\"session_id\":\"session\"'*'\"subagent_id\":\"token-a\"'*) ;; *) exit 7 ;; esac\nprintf '%s' '{\"version\":1,\"detail\":{\"title\":\"Skill\",\"source\":\"/tmp/project/SKILL.md\",\"text\":\"details\"}}'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let config = ExtensionsConfig {
+            version: 1,
+            providers: BTreeMap::from([(
+                "claude".into(),
+                ProviderConfig {
+                    argv: vec![script.to_string_lossy().into_owned()],
+                    timeout_ms: 100,
+                    env: BTreeMap::new(),
+                },
+            )]),
+            ..ExtensionsConfig::default()
+        };
+
+        let detail = detail(
+            &config,
+            "claude",
+            "%1",
+            Some("/tmp/project"),
+            Some("session"),
+            "token-a",
+        )
+        .unwrap();
+        assert_eq!(detail.source, "/tmp/project/SKILL.md");
+    }
+
     #[test]
     fn stale_cache_is_preserved_when_collector_fails() {
         let config = ExtensionsConfig {
@@ -632,6 +743,7 @@ mod tests {
                 ProviderConfig {
                     argv: vec!["definitely-not-a-command".into()],
                     timeout_ms: 1,
+                    env: BTreeMap::new(),
                 },
             )]),
             ..ExtensionsConfig::default()
@@ -648,6 +760,7 @@ mod tests {
                         evidence: Evidence::Observed,
                         source: String::new(),
                         detail_token: None,
+                        category: None,
                     }],
                     ..Reply::default()
                 },
@@ -668,6 +781,7 @@ mod tests {
                 ProviderConfig {
                     argv: vec!["/definitely-not-a-command".into()],
                     timeout_ms: 1,
+                    env: BTreeMap::new(),
                 },
             )]),
             ..ExtensionsConfig::default()
@@ -684,6 +798,7 @@ mod tests {
                         evidence: Evidence::Observed,
                         source: String::new(),
                         detail_token: None,
+                        category: None,
                     }],
                     ..Reply::default()
                 },
@@ -731,24 +846,81 @@ mod tests {
     fn reply_rejects_capability_tree_cycle() {
         let reply = Reply {
             version: 1,
+            agents: vec![AgentNode {
+                id: "agent".into(),
+                parent_id: None,
+                label: "agent".into(),
+                model: None,
+            }],
             tree: vec![
                 TreeNode {
                     id: "a".into(),
+                    agent_id: "agent".into(),
                     parent_id: Some("b".into()),
                     label: "A".into(),
                     fact_ids: vec![],
                     detail_token: None,
+                    category: None,
                 },
                 TreeNode {
                     id: "b".into(),
+                    agent_id: "agent".into(),
                     parent_id: Some("a".into()),
                     label: "B".into(),
                     fact_ids: vec![],
                     detail_token: None,
+                    category: None,
                 },
             ],
             ..Reply::default()
         };
         assert!(validate_reply(&reply).unwrap_err().contains("cycle"));
+    }
+
+    #[test]
+    fn reply_rejects_cross_agent_capability_parent() {
+        let reply = Reply {
+            version: 1,
+            agents: vec![
+                AgentNode {
+                    id: "one".into(),
+                    parent_id: None,
+                    label: "one".into(),
+                    model: None,
+                },
+                AgentNode {
+                    id: "two".into(),
+                    parent_id: Some("one".into()),
+                    label: "two".into(),
+                    model: None,
+                },
+            ],
+            tree: vec![
+                TreeNode {
+                    id: "root".into(),
+                    agent_id: "one".into(),
+                    parent_id: None,
+                    label: "root".into(),
+                    fact_ids: vec![],
+                    detail_token: None,
+                    category: None,
+                },
+                TreeNode {
+                    id: "child".into(),
+                    agent_id: "two".into(),
+                    parent_id: Some("root".into()),
+                    label: "child".into(),
+                    fact_ids: vec![],
+                    detail_token: None,
+                    category: None,
+                },
+            ],
+            ..Reply::default()
+        };
+        assert!(
+            validate_reply(&reply)
+                .unwrap_err()
+                .contains("another agent")
+        );
     }
 }

@@ -106,6 +106,69 @@ fn snapshot_transcript_replaces_sidebar_at_narrow_width() {
     ");
 }
 
+#[test]
+fn snapshot_transcript_resize_clamps_unicode_scroll_before_render() {
+    let mut state = make_state(vec![]);
+    state.bottom_panel_height = 20;
+    state.extensions.ui.transcript.view = Some(TranscriptView {
+        target: SubagentTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            session_id: Some("session".into()),
+            agent_id: "worker".into(),
+            node_id: "worker".into(),
+        },
+        document: TranscriptDocument {
+            agent_id: "worker".into(),
+            title: "Unicode transcript".into(),
+            lifecycle: Default::default(),
+            truncated_before: false,
+            truncated_after: false,
+            items: vec![TranscriptItem {
+                kind: TranscriptItemKind::Assistant,
+                text: "日本語 e\u{301} 日本語 e\u{301}".into(),
+            }],
+        },
+        scroll: usize::MAX,
+        max_scroll: 0,
+        previous_selection: None,
+        previous_pane_scroll: 0,
+    });
+
+    let narrow = render_to_string(&mut state, 14, 7);
+    let narrow_max_scroll = state
+        .extensions
+        .ui
+        .transcript
+        .view
+        .as_ref()
+        .unwrap()
+        .max_scroll;
+    assert_eq!(
+        state.extensions.ui.transcript.view.as_ref().unwrap().scroll,
+        narrow_max_scroll
+    );
+
+    let wide = render_to_string(&mut state, 26, 10);
+    let view = state.extensions.ui.transcript.view.as_ref().unwrap();
+    assert!(view.max_scroll < narrow_max_scroll);
+    assert_eq!(view.scroll, view.max_scroll);
+    insta::assert_snapshot!(format!("narrow:\n{narrow}\nwide:\n{wide}"), @r###"
+    narrow:
+    ╭ Unicode tr…╮
+    │    ← Back  │
+    │日 本 語  é    │
+    │日 本 語  é    │
+    ╰────────────╯
+    wide:
+    ╭ Unicode transcript ────╮
+    │                ← Back  │
+    │assistant:              │
+    │日 本 語  é 日 本 語  é       │
+    ╰────────────────────────╯
+    "###);
+}
+
 // Locks down the secondary header layout when there are no notices —
 // `make_state()` injects a Claude missing-hook notice as the shared
 // baseline so the ⓘ badge is on every other snapshot, which means a

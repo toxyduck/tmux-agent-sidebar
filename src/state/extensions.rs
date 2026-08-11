@@ -247,13 +247,13 @@ impl CapabilityUiState {
                 && !reply
                     .agents
                     .iter()
-                    .any(|agent| agent.id == request.target.agent_id)
+                    .any(|agent| agent.id == request.target.agent_id && agent.transcript_available)
         }) || self.transcript.view.as_ref().is_some_and(|view| {
             view.target.matches_cache_key(key)
                 && !reply
                     .agents
                     .iter()
-                    .any(|agent| agent.id == view.target.agent_id)
+                    .any(|agent| agent.id == view.target.agent_id && agent.transcript_available)
         }) {
             self.transcript = TranscriptUiState::default();
         }
@@ -1255,5 +1255,41 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         state.reload_config(true);
         assert!(state.ui.is_expanded(&target));
+    }
+
+    #[test]
+    fn transcript_loading_is_dropped_when_inspect_revokes_availability() {
+        let (mut state, _result_tx) = test_extensions_state(PathBuf::new());
+        let target = crate::state::SubagentTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            session_id: Some("session".into()),
+            agent_id: "child".into(),
+            node_id: "child".into(),
+        };
+        state.ui.transcript.loading = Some(TranscriptRequest {
+            id: 7,
+            target: target.clone(),
+            previous_selection: None,
+            previous_pane_scroll: 0,
+        });
+        state.ui.invalidate_missing_transient_targets(
+            &CacheKey::new("claude", "%1", Some("session")),
+            &Reply {
+                version: 1,
+                agents: vec![crate::extension::AgentNode {
+                    id: target.agent_id,
+                    parent_id: Some("main".into()),
+                    label: "worker".into(),
+                    role: crate::extension::AgentRole::Subagent,
+                    model: None,
+                    lifecycle: crate::extension::AgentLifecycle::Completed,
+                    transcript_available: false,
+                }],
+                ..Reply::default()
+            },
+        );
+        assert!(state.ui.transcript.loading.is_none());
+        assert!(state.ui.transcript.view.is_none());
     }
 }

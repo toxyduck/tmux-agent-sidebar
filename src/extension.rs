@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+pub const MAX_TRANSCRIPT_ITEM_BYTES: usize = 8192;
+pub const MAX_TRANSCRIPT_BYTES: usize = 262_144;
 /// The sidebar deliberately negotiates only named v1 features. Unknown
 /// collector features are ignored so a newer collector remains compatible.
 pub const CAPABILITY_AGENT_LIFECYCLE_V1: &str = "agent_lifecycle_v1";
@@ -850,14 +852,16 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
     }
     if let Some(transcript) = &reply.transcript {
         if !valid(&transcript.agent_id)
-            || !agent_ids.contains(transcript.agent_id.as_str())
             || !valid(&transcript.title)
             || transcript.items.len() > MAX_TRANSCRIPT_ITEMS
         {
             return Err("invalid transcript reply".into());
         }
+        let mut aggregate_bytes = 0usize;
         for item in &transcript.items {
-            if item.text.len() > MAX_TEXT
+            aggregate_bytes = aggregate_bytes.saturating_add(item.text.len());
+            if item.text.len() > MAX_TRANSCRIPT_ITEM_BYTES
+                || aggregate_bytes > MAX_TRANSCRIPT_BYTES
                 || item
                     .text
                     .chars()
@@ -981,12 +985,12 @@ mod tests {
     }
 
     #[test]
-    fn transcript_requires_matching_agent_id() {
+    fn transcript_reply_agent_id_is_not_coupled_to_inspect_agents() {
         let reply: Reply = serde_json::from_str(
             r#"{"version":1,"agents":[{"id":"child","label":"worker"}],"transcript":{"agent_id":"other","title":"Worker","items":[{"kind":"assistant","text":"done"}]}}"#,
         )
         .unwrap();
-        assert!(validate_reply(&reply).unwrap_err().contains("transcript"));
+        validate_reply(&reply).unwrap();
     }
 
     #[test]
@@ -1009,6 +1013,66 @@ mod tests {
                 "\"capabilities\":[\"agent_lifecycle_v1\",\"transcript_v1\",\"activation_outcome_v1\"]"
             ));
         }
+    }
+
+    fn transcript_reply_with_text(text: String) -> Reply {
+        Reply {
+            version: PROTOCOL_VERSION,
+            transcript: Some(TranscriptDocument {
+                agent_id: "child".into(),
+                title: "Worker".into(),
+                lifecycle: AgentLifecycle::Completed,
+                truncated_before: false,
+                truncated_after: false,
+                items: vec![TranscriptItem {
+                    kind: TranscriptItemKind::Assistant,
+                    text,
+                }],
+            }),
+            ..Reply::default()
+        }
+    }
+
+    #[test]
+    fn transcript_reply_does_not_require_inspect_agents_and_accepts_eight_kib_item() {
+        validate_reply(&transcript_reply_with_text(
+            "x".repeat(MAX_TRANSCRIPT_ITEM_BYTES),
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn collector_transcript_v1_fixture_matches_wire_contract() {
+        let reply: Reply = serde_json::from_str(include_str!(
+            "../tests/fixtures/collector-transcript-v1.json"
+        ))
+        .unwrap();
+        validate_reply(&reply).unwrap();
+        let transcript = reply.transcript.unwrap();
+        assert_eq!(transcript.agent_id, "worker-7");
+        assert!(transcript.truncated_before);
+        assert!(matches!(
+            transcript.items[1].kind,
+            TranscriptItemKind::ToolResult
+        ));
+    }
+
+    #[test]
+    fn transcript_reply_rejects_item_and_aggregate_byte_overflow() {
+        assert!(
+            validate_reply(&transcript_reply_with_text(
+                "x".repeat(MAX_TRANSCRIPT_ITEM_BYTES + 1)
+            ))
+            .is_err()
+        );
+        let mut reply = transcript_reply_with_text("x".repeat(MAX_TRANSCRIPT_ITEM_BYTES));
+        reply.transcript.as_mut().unwrap().items = (0..33)
+            .map(|_| TranscriptItem {
+                kind: TranscriptItemKind::ToolResult,
+                text: "x".repeat(MAX_TRANSCRIPT_ITEM_BYTES),
+            })
+            .collect();
+        assert!(validate_reply(&reply).is_err());
     }
 
     #[cfg(unix)]
@@ -1254,6 +1318,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(document.items[0].text, "done");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_request_rejects_collector_document_for_another_agent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("collector");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"version\":1,\"transcript\":{\"agent_id\":\"other\",\"title\":\"Worker\",\"items\":[{\"kind\":\"assistant\",\"text\":\"done\"}]}}'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let config = ExtensionsConfig {
+            version: 1,
+            providers: BTreeMap::from([(
+                "claude".into(),
+                ProviderConfig {
+                    argv: vec![script.to_string_lossy().into_owned()],
+                    timeout_ms: 100,
+                    env: BTreeMap::new(),
+                },
+            )]),
+            ..ExtensionsConfig::default()
+        };
+        let error = match transcript(
+            &config,
+            TranscriptRequest {
+                provider: "claude",
+                pane_id: "%1",
+                session_id: None,
+                agent_id: "child",
+                cwd: None,
+                pane_pid: None,
+                current_command: None,
+            },
+        ) {
+            Ok(_) => panic!("collector transcript for another agent was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("agent id"));
     }
 
     #[test]

@@ -683,7 +683,7 @@ pub fn draw_detail(frame: &mut Frame, state: &mut AppState, area: Rect) {
 pub fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let theme = &state.theme;
     state.layout.transcript_back_rect = None;
-    let (title, text, scroll) = if let Some(view) = state.extensions.ui.transcript.view.as_ref() {
+    let (title, text) = if let Some(view) = state.extensions.ui.transcript.view.as_ref() {
         let mut text = String::new();
         if view.document.truncated_before {
             text.push_str("… earlier transcript omitted …\n\n");
@@ -697,13 +697,9 @@ pub fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
         if view.document.truncated_after {
             text.push_str("… later transcript omitted …");
         }
-        (view.document.title.clone(), text, view.scroll)
+        (view.document.title.clone(), text)
     } else {
-        (
-            "Transcript".to_string(),
-            "Loading transcript…".to_string(),
-            0,
-        )
+        ("Transcript".to_string(), "Loading transcript…".to_string())
     };
     let title = truncate_to_width(
         &format!(" {} ", title),
@@ -744,13 +740,18 @@ pub fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
         inner.width,
         inner.height.saturating_sub(1),
     );
-    let wrapped_lines = text.lines().fold(0usize, |total, line| {
-        total + line.chars().count().max(1).div_ceil(inner.width as usize)
-    });
+    let wrapped_lines = transcript_wrapped_lines(&text, inner.width as usize);
     if let Some(view) = state.extensions.ui.transcript.view.as_mut() {
         view.max_scroll = wrapped_lines.saturating_sub(text_area.height as usize);
         view.scroll = view.scroll.min(view.max_scroll);
     }
+    let scroll = state
+        .extensions
+        .ui
+        .transcript
+        .view
+        .as_ref()
+        .map_or(0, |view| view.scroll);
     frame.render_widget(
         Paragraph::new(text)
             .style(Style::default().fg(theme.text_active))
@@ -758,6 +759,29 @@ pub fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
             .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         text_area,
     );
+}
+
+fn transcript_wrapped_lines(text: &str, width: usize) -> usize {
+    use unicode_width::UnicodeWidthChar;
+
+    if width == 0 {
+        return 0;
+    }
+    let mut lines = 0usize;
+    for line in text.split('\n') {
+        let mut used = 0usize;
+        let mut wrapped = 1usize;
+        for ch in line.chars() {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if char_width > 0 && used > 0 && used + char_width > width {
+                wrapped += 1;
+                used = 0;
+            }
+            used += char_width;
+        }
+        lines += wrapped;
+    }
+    lines
 }
 
 fn transcript_item_label(kind: crate::extension::TranscriptItemKind) -> &'static str {
@@ -918,5 +942,12 @@ mod tests {
         assert_eq!(layout.list_area.x, 5);
         assert_eq!(layout.list_area.y, 12);
         assert_eq!(layout.list_area.height, 13);
+    }
+
+    #[test]
+    fn transcript_wrap_counts_display_width_for_cjk_and_combining_text() {
+        assert_eq!(transcript_wrapped_lines("日本語", 4), 2);
+        assert_eq!(transcript_wrapped_lines("e\u{301}", 1), 1);
+        assert_eq!(transcript_wrapped_lines("ab\ncd", 1), 4);
     }
 }

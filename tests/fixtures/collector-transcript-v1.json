@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "activation": {"outcome": "transcript_fallback"},
+  "transcript": {
+    "agent_id": "worker-7",
+    "title": "Worker transcript",
+    "lifecycle": "completed",
+    "truncated_before": true,
+    "truncated_after": false,
+    "items": [
+      {"kind": "developer", "text": "Inspect the implementation."},
+      {"kind": "tool_result", "text": "ok"}
+    ]
+  }
+}

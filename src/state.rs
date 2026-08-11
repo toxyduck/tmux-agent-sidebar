@@ -528,6 +528,19 @@ impl AppState {
     fn accepts_transcript(&self, request: &extensions::TranscriptRequest) -> bool {
         self.extensions.ui.transcript.loading.as_ref() == Some(request)
             && self.subagent_target_matches_live_inspection(&request.target)
+            && self
+                .extensions
+                .inspection(
+                    &request.target.parent_pane_id,
+                    &request.target.provider_id,
+                    request.target.session_id.as_deref(),
+                )
+                .is_some_and(|inspection| {
+                    !inspection.stale
+                        && inspection.reply.agents.iter().any(|agent| {
+                            agent.id == request.target.agent_id && agent.transcript_available
+                        })
+                })
     }
 
     fn capability_target_matches_live_pane(&self, target: &TreeTarget) -> bool {

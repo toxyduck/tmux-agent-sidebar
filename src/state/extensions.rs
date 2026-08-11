@@ -145,12 +145,12 @@ impl CapabilityUiState {
         {
             self.selected = None;
         }
-        if let Some(detail) = &mut self.detail
-            && detail.previous_selection.as_ref().is_some_and(|target| {
+        if self.detail.as_ref().is_some_and(|detail| {
+            detail.previous_selection.as_ref().is_some_and(|target| {
                 !live_scopes.contains(&PaneScopeKey::from_tree_target(target))
             })
-        {
-            detail.previous_selection = None;
+        }) {
+            self.detail = None;
         }
     }
 
@@ -164,13 +164,13 @@ impl CapabilityUiState {
         {
             self.selected = None;
         }
-        if let Some(detail) = &mut self.detail
-            && detail
+        if self.detail.as_ref().is_some_and(|detail| {
+            detail
                 .previous_selection
                 .as_ref()
                 .is_some_and(|target| !configured_providers.contains(&target.provider_id))
-        {
-            detail.previous_selection = None;
+        }) {
+            self.detail = None;
         }
     }
 
@@ -182,13 +182,13 @@ impl CapabilityUiState {
         {
             self.selected = None;
         }
-        if let Some(detail) = &mut self.detail
-            && detail
+        if self.detail.as_ref().is_some_and(|detail| {
+            detail
                 .previous_selection
                 .as_ref()
                 .is_some_and(|target| target.matches_cache_key(key) && !target.exists_in(reply))
-        {
-            detail.previous_selection = None;
+        }) {
+            self.detail = None;
         }
     }
 }
@@ -494,6 +494,17 @@ impl ExtensionsState {
         results
     }
 
+    pub(crate) fn accepts_detail(&self, target: &TreeTarget) -> bool {
+        self.ui.selected.as_ref() == Some(target)
+            && self
+                .inspection(
+                    &target.parent_pane_id,
+                    &target.provider_id,
+                    target.session_id.as_deref(),
+                )
+                .is_some_and(|inspection| !inspection.stale && target.exists_in(&inspection.reply))
+    }
+
     fn reload_config(&mut self, force: bool) {
         let mtime = std::fs::metadata(&self.config_path)
             .and_then(|meta| meta.modified())
@@ -646,6 +657,29 @@ mod tests {
         }
     }
 
+    fn reply_with_target(target: &TreeTarget) -> Reply {
+        Reply {
+            version: 1,
+            agents: vec![crate::extension::AgentNode {
+                id: target.agent_id.clone(),
+                parent_id: None,
+                label: "Agent".into(),
+                role: crate::extension::AgentRole::Main,
+                model: None,
+            }],
+            tree: vec![crate::extension::TreeNode {
+                id: target.node_id.clone(),
+                agent_id: target.agent_id.clone(),
+                parent_id: None,
+                label: "Skills".into(),
+                fact_ids: vec!["skill".into()],
+                detail_token: None,
+                category: "skills".into(),
+            }],
+            ..Reply::default()
+        }
+    }
+
     #[test]
     fn cache_key_keeps_session_snapshots_separate() {
         let first = CacheKey::new("claude", "%1", Some("one"));
@@ -773,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_inspect_invalidates_missing_selection_and_detail_restore_target() {
+    fn successful_inspect_invalidates_missing_selection_and_closes_detail() {
         let missing = disclosure_target("claude", "%1", Some("one"), "main", "skills");
         let mut ui = CapabilityUiState {
             selected: Some(missing.clone()),
@@ -803,7 +837,75 @@ mod tests {
         );
 
         assert!(ui.selected.is_none());
-        assert!(ui.detail.unwrap().previous_selection.is_none());
+        assert!(ui.detail.is_none());
+    }
+
+    #[test]
+    fn detail_from_reused_pane_session_is_rejected() {
+        let (mut state, _result_tx) = test_extensions_state(PathBuf::new());
+        let old = disclosure_target("claude", "%1", Some("old"), "main", "skills");
+        let new = disclosure_target("claude", "%1", Some("new"), "main", "skills");
+        state.ui.selected = Some(old.clone());
+        state.cache.insert(
+            CacheKey::new("claude", "%1", Some("new")),
+            Inspection {
+                reply: reply_with_target(&new),
+                stale: false,
+            },
+        );
+        state.ui.prune_dead_scopes(&HashSet::from([PaneScopeKey {
+            provider_id: "claude".into(),
+            parent_pane_id: "%1".into(),
+            session_id: Some("new".into()),
+        }]));
+
+        assert!(state.ui.selected.is_none());
+        assert!(!state.accepts_detail(&old));
+    }
+
+    #[test]
+    fn detail_is_rejected_after_newer_inspect_removes_target() {
+        let (mut state, _result_tx) = test_extensions_state(PathBuf::new());
+        let target = disclosure_target("claude", "%1", Some("session"), "main", "skills");
+        state.ui.selected = Some(target.clone());
+        state.cache.insert(
+            CacheKey::new("claude", "%1", Some("session")),
+            Inspection {
+                reply: Reply {
+                    version: 1,
+                    agents: vec![crate::extension::AgentNode {
+                        id: "main".into(),
+                        parent_id: None,
+                        label: "Agent".into(),
+                        role: crate::extension::AgentRole::Main,
+                        model: None,
+                    }],
+                    ..Reply::default()
+                },
+                stale: false,
+            },
+        );
+
+        assert!(!state.accepts_detail(&target));
+    }
+
+    #[test]
+    fn detail_requires_exact_selected_target_and_fresh_inspection() {
+        let (mut state, _result_tx) = test_extensions_state(PathBuf::new());
+        let target = disclosure_target("claude", "%1", Some("session"), "main", "skills");
+        let key = CacheKey::new("claude", "%1", Some("session"));
+        state.ui.selected = Some(target.clone());
+        state.cache.insert(
+            key.clone(),
+            Inspection {
+                reply: reply_with_target(&target),
+                stale: false,
+            },
+        );
+        assert!(state.accepts_detail(&target));
+
+        state.cache.get_mut(&key).unwrap().stale = true;
+        assert!(!state.accepts_detail(&target));
     }
 
     #[test]

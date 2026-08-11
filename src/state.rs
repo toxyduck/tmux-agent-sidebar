@@ -327,14 +327,18 @@ impl AppState {
                     result,
                 } => match result {
                     Ok(detail) => {
-                        self.extensions.ui.detail = Some(DetailView {
-                            title: detail.title,
-                            source: canonical_source(&detail.source),
-                            text: sanitize_detail_text(&detail.text),
-                            scroll: 0,
-                            previous_selection: Some(target),
-                            previous_pane_scroll,
-                        });
+                        if self.capability_target_matches_live_pane(&target)
+                            && self.extensions.accepts_detail(&target)
+                        {
+                            self.extensions.ui.detail = Some(DetailView {
+                                title: detail.title,
+                                source: canonical_source(&detail.source),
+                                text: sanitize_detail_text(&detail.text),
+                                scroll: 0,
+                                previous_selection: Some(target),
+                                previous_pane_scroll,
+                            });
+                        }
                     }
                     Err(error) => self.set_flash(format!("Detail unavailable: {error}")),
                 },
@@ -348,6 +352,12 @@ impl AppState {
                 },
             }
         }
+    }
+
+    fn capability_target_matches_live_pane(&self, target: &TreeTarget) -> bool {
+        self.pane_by_id(&target.parent_pane_id).is_some_and(|pane| {
+            pane.agent.as_str() == target.provider_id && pane.session_id == target.session_id
+        })
     }
 }
 
@@ -408,6 +418,30 @@ mod tests {
         let path = crate::activity::log_file_path(pane_id);
         fs::write(&path, contents).unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn reused_pane_session_rejects_old_capability_detail_target() {
+        let mut state = AppState::new("%99".into());
+        let mut pane = test_pane("%1");
+        pane.session_id = Some("new-session".into());
+        state.repo_groups = vec![RepoGroup {
+            name: "repo".into(),
+            has_focus: true,
+            panes: vec![(pane, PaneGitInfo::default())],
+        }];
+        let old_target = TreeTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            session_id: Some("old-session".into()),
+            agent_id: "main".into(),
+            node_id: "skills".into(),
+            detail_token: Some("detail".into()),
+            inline_detail: None,
+            is_disclosure: false,
+        };
+
+        assert!(!state.capability_target_matches_live_pane(&old_target));
     }
 
     #[test]

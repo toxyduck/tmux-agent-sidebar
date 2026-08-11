@@ -329,7 +329,15 @@ mod tests {
         state.repo_groups = vec![RepoGroup {
             name: "repo".into(),
             has_focus: true,
-            panes: vec![(make_pane("%1", PaneStatus::Running), PaneGitInfo::default())],
+            panes: vec![(
+                make_pane("%1", PaneStatus::Running),
+                PaneGitInfo {
+                    repo_root: Some("/tmp/repo".into()),
+                    branch: Some("feature/very-long-branch-name-that-wraps".into()),
+                    is_worktree: false,
+                    worktree_name: None,
+                },
+            )],
         }];
         state.rebuild_row_targets();
         state.set_pane_ports("%1", vec![3000, 5173]);
@@ -341,6 +349,7 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         assert!(!hidden_text.iter().any(|line| line.contains(":3000")));
+        assert!(hidden_text.iter().any(|line| line.contains("feature")));
 
         state.show_ports = true;
         let visible = collect(&state, 14);
@@ -350,7 +359,9 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         assert!(visible_text.iter().any(|line| line.contains(":3000")));
-        assert!(hidden.lines.len() < visible.lines.len());
+        assert!(!visible_text.iter().any(|line| line.contains("feature")));
+        assert_ne!(hidden_text, visible_text);
+        assert_eq!(hidden.lines.len(), visible.lines.len());
     }
 
     #[test]

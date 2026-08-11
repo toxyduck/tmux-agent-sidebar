@@ -11,6 +11,42 @@ pub struct PaneProcessSnapshot {
     pub live_agent_panes: HashSet<String>,
 }
 
+/// Process-only agent liveness and command data. This never invokes `lsof`;
+/// callers use it to reconcile stale tagged panes even when port display is
+/// disabled or socket discovery fails.
+pub(crate) fn scan_session_agent_liveness(
+    sessions: &[SessionInfo],
+    process_snapshot: Option<&ProcessSnapshot>,
+) -> Option<PaneProcessSnapshot> {
+    let pane_pids = parse_pane_pids(sessions);
+    if pane_pids.is_empty() {
+        return Some(PaneProcessSnapshot::default());
+    }
+    let process_snapshot = process_snapshot?;
+    let mut live_agent_panes = HashSet::new();
+    let mut command_by_pane = HashMap::new();
+    for session in sessions {
+        for window in &session.windows {
+            for pane in &window.panes {
+                let Some(&pane_pid) = pane_pids.get(&pane.pane_id) else {
+                    continue;
+                };
+                if process_snapshot.tree_has_agent(&[pane_pid], &pane.agent) {
+                    live_agent_panes.insert(pane.pane_id.clone());
+                }
+                if let Some(command) = best_command_for_pane(pane_pid, process_snapshot) {
+                    command_by_pane.insert(pane.pane_id.clone(), command);
+                }
+            }
+        }
+    }
+    Some(PaneProcessSnapshot {
+        ports_by_pane: HashMap::new(),
+        command_by_pane,
+        live_agent_panes,
+    })
+}
+
 fn run_command(cmd: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(cmd).args(args).output().ok()?;
     if output.status.success() {
@@ -197,6 +233,55 @@ pub fn scan_session_ports(sessions: &[SessionInfo]) -> HashMap<String, Vec<u16>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn liveness_session() -> Vec<SessionInfo> {
+        vec![SessionInfo {
+            session_name: "main".into(),
+            windows: vec![crate::tmux::WindowInfo {
+                window_id: "@1".into(),
+                window_name: "project".into(),
+                window_active: true,
+                auto_rename: false,
+                panes: vec![crate::tmux::PaneInfo {
+                    pane_id: "%1".into(),
+                    pane_active: true,
+                    status: crate::tmux::PaneStatus::Running,
+                    attention: false,
+                    agent: crate::tmux::AgentType::Codex,
+                    path: "/tmp/project".into(),
+                    current_command: "zsh".into(),
+                    prompt: String::new(),
+                    prompt_is_response: false,
+                    started_at: None,
+                    wait_reason: String::new(),
+                    permission_mode: crate::tmux::PermissionMode::Default,
+                    subagents: Vec::new(),
+                    pane_pid: Some(10),
+                    worktree: crate::tmux::WorktreeMetadata::default(),
+                    session_id: Some("session".into()),
+                    session_name: String::new(),
+                    sidebar_spawned: false,
+                    bg_shell_cmd: None,
+                }],
+            }],
+        }]
+    }
+
+    #[test]
+    fn process_only_liveness_needs_no_socket_scan() {
+        let sessions = liveness_session();
+        let process_snapshot =
+            ProcessSnapshot::from_ps_output("10 1 zsh zsh\n11 10 codex codex --full-auto\n");
+
+        let scanned = scan_session_agent_liveness(&sessions, Some(&process_snapshot)).unwrap();
+
+        assert!(scanned.live_agent_panes.contains("%1"));
+        assert!(scanned.ports_by_pane.is_empty());
+        assert_eq!(
+            scanned.command_by_pane.get("%1"),
+            Some(&"codex --full-auto".into())
+        );
+    }
 
     #[test]
     fn extract_port_handles_common_lsof_names() {

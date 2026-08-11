@@ -860,7 +860,7 @@ mod tests {
         let script = dir.path().join("collector");
         std::fs::write(
             &script,
-            "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in *'\"op\":\"activate\"'*'\"pane_id\":\"%1\"'*'\"session_id\":\"session\"'*'\"pane_pid\":42'*'\"current_command\":\"claude\"'*'\"subagent_id\":\"child\"'*) ;; *) exit 7 ;; esac\nprintf '%s' '{\"version\":1}'\n",
+            "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in *'\"op\":\"activate\"'*'\"pane_id\":\"%1\"'*'\"cwd\":\"/tmp/project\"'*'\"session_id\":\"session\"'*'\"pane_pid\":42'*'\"current_command\":\"claude\"'*'\"subagent_id\":\"child\"'*) ;; *) exit 7 ;; esac\nprintf '%s' '{\"version\":1}'\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();

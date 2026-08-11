@@ -1,14 +1,12 @@
 use std::collections::HashSet;
-use std::path::Path;
 
 use crate::process::{ProcessSnapshot, command_basename};
 
 use super::commands::run_tmux;
 use super::options::{
-    PANE_AGENT, PANE_ATTENTION, PANE_BG_CMD, PANE_CWD, PANE_NAME, PANE_PENDING_SESSION_END,
-    PANE_PENDING_WORKTREE_REMOVE, PANE_PERMISSION_MODE, PANE_PROMPT, PANE_PROMPT_SOURCE, PANE_ROLE,
-    PANE_SESSION_ID, PANE_STARTED_AT, PANE_STATUS, PANE_SUBAGENTS, PANE_WAIT_REASON,
-    PANE_WORKTREE_BRANCH, PANE_WORKTREE_NAME, unset_pane_option,
+    PANE_AGENT, PANE_ATTENTION, PANE_BG_CMD, PANE_CWD, PANE_NAME, PANE_PERMISSION_MODE,
+    PANE_PROMPT, PANE_PROMPT_SOURCE, PANE_ROLE, PANE_SESSION_ID, PANE_STARTED_AT, PANE_STATUS,
+    PANE_SUBAGENTS, PANE_WAIT_REASON, PANE_WORKTREE_BRANCH, PANE_WORKTREE_NAME,
 };
 use super::types::{
     AgentType, CODEX_AGENT, PaneInfo, PaneStatus, PermissionMode, SessionInfo, WindowInfo,
@@ -256,7 +254,7 @@ pub(crate) fn parse_pane_line(line: &str) -> Option<PaneInfo> {
 
 fn parse_pane_fields_with_processes(
     parts: &[String],
-    process_snapshot: Option<&ProcessSnapshot>,
+    _process_snapshot: Option<&ProcessSnapshot>,
 ) -> Option<PaneInfo> {
     if parts.len() < pane_line_field::MIN_FIELDS {
         return None;
@@ -267,30 +265,7 @@ fn parse_pane_fields_with_processes(
     }
 
     let agent = AgentType::from_label(&parts[pane_line_field::AGENT])?;
-    let current_command = parts[pane_line_field::PANE_CURRENT_COMMAND].as_str();
     let pane_pid: Option<u32> = parts[pane_line_field::PANE_PID].parse().ok();
-
-    // Codex / OpenCode panes can leave stale tmux metadata behind after the
-    // agent exits and the pane falls back to the user's shell. Neither
-    // agent exposes a reliable "process exit" hook (Codex has no such
-    // hook, OpenCode runs under Bun where `process.on("exit")` does not
-    // fire our handlers), so the Rust polling side must own teardown:
-    // wipe pane options + activity log the first poll after the agent
-    // is gone. Subsequent polls short-circuit at the `AgentType::from_label`
-    // check above once `@pane_agent` has been cleared. Claude is excluded
-    // because its SessionEnd hook drives cleanup instead.
-    if matches!(agent, AgentType::Codex | AgentType::OpenCode) && is_shell_command(current_command)
-    {
-        let agent_still_alive = pane_pid
-            .and_then(|pid| {
-                process_snapshot.map(|snapshot| snapshot.tree_has_agent(&[pid], &agent))
-            })
-            .unwrap_or(false);
-        if !agent_still_alive {
-            clear_agent_pane_state(&parts[pane_line_field::PANE_ID]);
-            return None;
-        }
-    }
 
     // Prefer @pane_cwd (set by hook from agent's cwd) over pane_current_path
     let pane_cwd = &parts[pane_line_field::PANE_CWD];
@@ -351,75 +326,6 @@ fn parse_pane_fields_with_processes(
             }
         },
     })
-}
-
-/// Wipe all agent-tracked tmux pane options and the activity log file for
-/// `pane_id`. Triggered by `parse_pane_fields` when it detects a Codex or
-/// OpenCode pane that has dropped back to the user's shell, since neither
-/// CLI fires a reliable process-exit hook. Claude panes are never routed
-/// here because Claude has its own SessionEnd hook. The set of keys
-/// mirrors `clear_all_meta` + `clear_run_state` + status/attention clears
-/// in `src/cli/hook/context.rs`; keep them in sync when a new `@pane_*`
-/// key is added.
-fn clear_agent_pane_state(pane_id: &str) {
-    const KEYS: &[&str] = &[
-        PANE_AGENT,
-        PANE_PROMPT,
-        PANE_PROMPT_SOURCE,
-        PANE_BG_CMD,
-        PANE_SUBAGENTS,
-        PANE_CWD,
-        PANE_PERMISSION_MODE,
-        PANE_WORKTREE_NAME,
-        PANE_WORKTREE_BRANCH,
-        PANE_SESSION_ID,
-        PANE_PENDING_SESSION_END,
-        PANE_PENDING_WORKTREE_REMOVE,
-        PANE_STARTED_AT,
-        PANE_WAIT_REASON,
-        PANE_ATTENTION,
-        PANE_STATUS,
-    ];
-    for key in KEYS {
-        unset_pane_option(pane_id, key);
-    }
-    let log_path = crate::activity::log_file_path(pane_id);
-    let _ = std::fs::remove_file(log_path);
-}
-
-fn is_shell_command(command: &str) -> bool {
-    const SHELL_COMMANDS: &[&str] = &[
-        "ash",
-        "bash",
-        "csh",
-        "dash",
-        "elvish",
-        "fish",
-        "ksh",
-        "mksh",
-        "nu",
-        "oksh",
-        "pdksh",
-        "posh",
-        "powershell",
-        "powershell.exe",
-        "pwsh",
-        "sh",
-        "tcsh",
-        "xonsh",
-        "zsh",
-    ];
-
-    let Some(token) = command.split_whitespace().next() else {
-        return false;
-    };
-    let executable = Path::new(token)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(token)
-        .to_ascii_lowercase();
-
-    SHELL_COMMANDS.contains(&executable.as_str())
 }
 
 /// Detect Codex permission mode from process args (--full-auto, --yolo, etc.)
@@ -956,27 +862,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_pane_line_rejects_stale_codex_shell_pane() {
+    fn parse_pane_line_keeps_tagged_codex_shell_pane_without_process_snapshot() {
         let mut fields = full_fields();
         fields[3] = "codex";
         fields[6] = "zsh";
         let line = make_pane_line(&fields);
-        assert!(
-            parse_pane_line(&line).is_none(),
-            "codex metadata on a shell pane should be treated as stale"
-        );
+        assert!(parse_pane_line(&line).is_some());
     }
 
     #[test]
-    fn parse_pane_line_rejects_stale_codex_shell_pane_with_path_and_args() {
+    fn parse_pane_line_keeps_tagged_codex_shell_pane_with_path_and_args() {
         let mut fields = full_fields();
         fields[3] = "codex";
         fields[6] = "/usr/local/bin/PwSh -l";
         let line = make_pane_line(&fields);
-        assert!(
-            parse_pane_line(&line).is_none(),
-            "shell detection should handle paths, args, and case differences"
-        );
+        assert!(parse_pane_line(&line).is_some());
     }
 
     #[test]
@@ -1062,11 +962,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_pane_line_wipes_stale_state_for_codex_shell_pane() {
-        // Codex shares the same shell-fallback sweep path as OpenCode —
-        // neither fires a reliable process-exit hook, so the Rust poller
-        // must clear @pane_* keys and the activity log when the pane
-        // reverts to a shell. Mirrors the OpenCode regression test below.
+    fn parse_pane_line_keeps_tagged_codex_shell_pane_when_process_is_unknown() {
+        // Missing process data is unknown, not an exit signal. The parser
+        // retains tagged panes; refresh liveness owns verified teardown.
         let _guard = test_mock::install();
         let pane = "%CODEX_STALE";
         test_mock::set(pane, PANE_AGENT, "codex");
@@ -1086,7 +984,7 @@ mod tests {
         fields[pane_line_field::PANE_CURRENT_COMMAND] = "zsh";
         let line = make_pane_line(&fields);
 
-        assert!(parse_pane_line(&line).is_none());
+        assert_eq!(parse_pane_line(&line).unwrap().agent, AgentType::Codex);
         for key in &[
             PANE_AGENT,
             PANE_PROMPT,
@@ -1097,23 +995,21 @@ mod tests {
             PANE_WAIT_REASON,
         ] {
             assert!(
-                !test_mock::contains(pane, key),
-                "{key} must be cleared when a codex pane falls back to shell"
+                test_mock::contains(pane, key),
+                "{key} must survive until refresh liveness reconciliation"
             );
         }
         assert!(
-            !log.exists(),
-            "codex activity log must be removed once the agent process is gone"
+            log.exists(),
+            "query parsing must not remove the activity log"
         );
     }
 
     #[test]
-    fn parse_pane_line_wipes_stale_state_for_opencode_shell_pane() {
-        // When an OpenCode pane falls back to the user's shell, the Rust
-        // polling side owns teardown because OpenCode has no reliable
-        // process-exit hook. The detector must unset every @pane_* key it
-        // seeded and remove the activity log so the next launch starts
-        // from a clean slate without flashing stale prompt/status.
+    fn parse_pane_line_keeps_tagged_opencode_shell_pane_when_process_is_unknown() {
+        // OpenCode follows the same contract: a shell current command alone
+        // cannot erase metadata before a successful process snapshot proves
+        // the agent absent.
         let _guard = test_mock::install();
         let pane = "%OPENCODE_STALE";
         test_mock::set(pane, PANE_AGENT, "opencode");
@@ -1133,7 +1029,7 @@ mod tests {
         fields[pane_line_field::PANE_CURRENT_COMMAND] = "fish";
         let line = make_pane_line(&fields);
 
-        assert!(parse_pane_line(&line).is_none());
+        assert_eq!(parse_pane_line(&line).unwrap().agent, AgentType::OpenCode);
         for key in &[
             PANE_AGENT,
             PANE_PROMPT,
@@ -1144,13 +1040,13 @@ mod tests {
             PANE_SESSION_ID,
         ] {
             assert!(
-                !test_mock::contains(pane, key),
-                "{key} must be cleared after shell fallback sweep"
+                test_mock::contains(pane, key),
+                "{key} must survive until refresh liveness reconciliation"
             );
         }
         assert!(
-            !log.exists(),
-            "activity log must be removed when the agent process is gone"
+            log.exists(),
+            "query parsing must not remove the activity log"
         );
     }
 

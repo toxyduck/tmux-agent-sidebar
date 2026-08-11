@@ -197,9 +197,14 @@ impl AppState {
             return window_active;
         };
         self.sweep_dead_bg_shells_if_due(&mut sessions, &mut process_snapshot);
+        if let Some(liveness) =
+            crate::port::scan_session_agent_liveness(&sessions, process_snapshot.as_ref())
+        {
+            self.reconcile_agent_liveness(&sessions, &liveness);
+            sessions = self.filter_sessions_after_process_liveness(sessions);
+        }
         if self.show_ports {
             self.refresh_port_data(&sessions, process_snapshot.as_ref());
-            sessions = self.filter_sessions_after_process_liveness(sessions);
         }
         self.apply_session_snapshot(focused, sessions);
         if self.sessions.dirty {
@@ -244,9 +249,11 @@ impl AppState {
                 // A failed process/socket sample is not an agent liveness
                 // result. Hide volatile ports, retain all agent metadata.
                 self.invalidate_process_sample(sessions);
+                self.timers.port_scan_initialized = true;
+                self.timers.last_port_refresh = std::time::Instant::now();
                 return None;
             };
-            self.apply_process_sample(sessions, &scanned);
+            self.apply_port_sample(sessions, &scanned);
             self.timers.port_scan_initialized = true;
             self.timers.last_port_refresh = std::time::Instant::now();
             return Some(scanned);
@@ -255,46 +262,57 @@ impl AppState {
         None
     }
 
-    fn apply_process_sample(
+    fn reconcile_agent_liveness(
         &mut self,
         sessions: &[SessionInfo],
         scanned: &crate::port::PaneProcessSnapshot,
     ) {
-        let mut updates: Vec<(String, Vec<u16>, Option<String>)> = Vec::new();
         let mut dead_panes: Vec<String> = Vec::new();
         for session in sessions {
             for window in &session.windows {
                 for pane in &window.panes {
-                    updates.push((
-                        pane.pane_id.clone(),
-                        scanned
-                            .ports_by_pane
-                            .get(&pane.pane_id)
-                            .cloned()
-                            .unwrap_or_default(),
-                        scanned.command_by_pane.get(&pane.pane_id).cloned(),
-                    ));
-                }
-            }
-        }
-        for (pane_id, ports, command) in updates {
-            let pane_state = self.pane_state_mut(&pane_id);
-            if scanned.live_agent_panes.contains(&pane_id) {
-                pane_state.process_liveness_misses = 0;
-                pane_state.ports = ports;
-                pane_state.command = command;
-            } else {
-                pane_state.process_liveness_misses =
-                    pane_state.process_liveness_misses.saturating_add(1);
-                pane_state.ports.clear();
-                pane_state.command = None;
-                if pane_state.process_liveness_misses >= 2 {
-                    dead_panes.push(pane_id);
+                    // tmux can omit pane_pid and an incomplete ps snapshot
+                    // cannot prove an agent absent; retain that pane.
+                    let Some(_) = pane.pane_pid else {
+                        continue;
+                    };
+                    let pane_state = self.pane_state_mut(&pane.pane_id);
+                    if scanned.live_agent_panes.contains(&pane.pane_id) {
+                        pane_state.process_liveness_misses = 0;
+                    } else {
+                        pane_state.process_liveness_misses =
+                            pane_state.process_liveness_misses.saturating_add(1);
+                        pane_state.ports.clear();
+                        pane_state.command = None;
+                        if pane_state.process_liveness_misses >= 2 {
+                            dead_panes.push(pane.pane_id.clone());
+                        }
+                    }
                 }
             }
         }
         for pane_id in dead_panes {
             Self::clear_dead_agent_metadata(&pane_id);
+        }
+    }
+
+    fn apply_port_sample(
+        &mut self,
+        sessions: &[SessionInfo],
+        scanned: &crate::port::PaneProcessSnapshot,
+    ) {
+        for pane in sessions
+            .iter()
+            .flat_map(|session| session.windows.iter())
+            .flat_map(|window| window.panes.iter())
+        {
+            let pane_state = self.pane_state_mut(&pane.pane_id);
+            pane_state.ports = scanned
+                .ports_by_pane
+                .get(&pane.pane_id)
+                .cloned()
+                .unwrap_or_default();
+            pane_state.command = scanned.command_by_pane.get(&pane.pane_id).cloned();
         }
     }
 
@@ -919,7 +937,9 @@ mod tests {
     #[test]
     fn process_liveness_preserves_first_miss_then_tears_down_second_miss() {
         let _guard = tmux::test_mock::install();
-        let sessions = test_session(vec![test_pane("%1")]);
+        let mut pane = test_pane("%1");
+        pane.pane_pid = Some(100);
+        let sessions = test_session(vec![pane]);
         let mut state = AppState::new("%sidebar".into());
         let live = crate::port::PaneProcessSnapshot {
             ports_by_pane: HashMap::from([("%1".into(), vec![3000])]),
@@ -928,11 +948,12 @@ mod tests {
         };
         let missing = crate::port::PaneProcessSnapshot::default();
 
-        state.apply_process_sample(&sessions, &live);
+        state.reconcile_agent_liveness(&sessions, &live);
+        state.apply_port_sample(&sessions, &live);
         assert_eq!(state.pane_ports("%1"), Some(&[3000][..]));
         assert_eq!(state.pane_state("%1").unwrap().process_liveness_misses, 0);
 
-        state.apply_process_sample(&sessions, &missing);
+        state.reconcile_agent_liveness(&sessions, &missing);
         assert_eq!(state.pane_ports("%1"), Some(&[][..]));
         assert_eq!(state.pane_state("%1").unwrap().process_liveness_misses, 1);
         assert_eq!(
@@ -942,7 +963,7 @@ mod tests {
             1
         );
 
-        state.apply_process_sample(&sessions, &missing);
+        state.reconcile_agent_liveness(&sessions, &missing);
         assert_eq!(state.pane_state("%1").unwrap().process_liveness_misses, 2);
         assert!(
             state
@@ -950,7 +971,8 @@ mod tests {
                 .is_empty()
         );
 
-        state.apply_process_sample(&sessions, &live);
+        state.reconcile_agent_liveness(&sessions, &live);
+        state.apply_port_sample(&sessions, &live);
         assert_eq!(state.pane_state("%1").unwrap().process_liveness_misses, 0);
         assert_eq!(state.pane_ports("%1"), Some(&[3000][..]));
     }

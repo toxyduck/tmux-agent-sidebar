@@ -818,8 +818,8 @@ fn snapshot_worktree_long_branch_truncated_ui() {
     insta::assert_snapshot!(output, @r"
      ≡1  ●0  ◎0  ◐0  ○1  ✕0
     ⓘ                        — ▾
-    ┃   + feature/very-long-bra…
-        Waiting for prompt…
+    project                    +
+    ┃ ○ claude
     ╭ Activity │ Git ──────────╮
     │      No activity yet     │
     ╰──────────────────────────╯
@@ -840,13 +840,14 @@ fn snapshot_long_branch_with_ports_ui() {
         has_focus: true,
         panes: vec![(pane, git_info)],
     }]);
+    state.show_ports = true;
     state.set_pane_ports("%1", vec![3000, 5173]);
 
     let output = render_to_string(&mut state, 40, 24);
     insta::assert_snapshot!(output, @r"
      ≡1  ●1  ◎0  ◐0  ○0  ✕0
     ⓘ                                    — ▾
-    ┃   feature/sidebar/really…  :3000, 5173
+    ┃ ● claude
     ╭ Activity │ Git ──────────────────────╮
     │            No activity yet           │
     ╰──────────────────────────────────────╯
@@ -875,8 +876,8 @@ fn snapshot_task_progress_partial_ui() {
     insta::assert_snapshot!(output, @r"
      ≡1  ●1  ◎0  ◐0  ○0  ✕0
     ⓘ                        — ▾
-        ✔◼◻ 1/3
-        working
+    project
+    ┃ ● claude
     ╭ Activity │ Git ──────────╮
     │      No activity yet     │
     ╰──────────────────────────╯
@@ -2233,6 +2234,7 @@ fn snapshot_sidebar_spawned_coexists_with_port_display() {
     };
     let mut state = make_state_with_groups(vec![group]);
     state.bottom_panel_height = 3;
+    state.show_ports = true;
     state.pane_state_mut("%9").ports = vec![3000];
     let output = render_to_string(&mut state, 30, 20);
     insta::assert_snapshot!(output, @r"

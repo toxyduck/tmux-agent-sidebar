@@ -58,6 +58,10 @@ impl AppState {
     pub fn apply_git_data(&mut self, data: crate::git::GitData) {
         self.git = data;
     }
+
+    pub fn apply_vcs_entries(&mut self, entries: Vec<crate::git::VcsEntry>) {
+        self.vcs_entries = entries;
+    }
 }
 
 #[cfg(test)]

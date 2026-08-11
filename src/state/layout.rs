@@ -43,6 +43,13 @@ pub struct SpawnRemoveTarget {
     pub pane_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct VcsBranchTarget {
+    pub rect: ratatui::layout::Rect,
+    pub kind: crate::git::VcsKind,
+    pub root: String,
+}
+
 /// Screen-positioned hyperlink overlay for OSC 8 terminal hyperlinks.
 #[derive(Debug, Clone)]
 pub struct HyperlinkOverlay {
@@ -83,6 +90,8 @@ pub struct FrameLayout {
     /// Click regions for the red `×` remove marker rendered next to the
     /// branch of each sidebar-spawned pane. One entry per visible row.
     pub spawn_remove_targets: Vec<SpawnRemoveTarget>,
+    /// Branch rows rendered in the Git/Arc tab.
+    pub vcs_branch_targets: Vec<VcsBranchTarget>,
     /// OSC 8 hyperlink overlays the main loop writes after each frame so
     /// terminals can recognise PR numbers as clickable links.
     pub hyperlink_overlays: Vec<HyperlinkOverlay>,

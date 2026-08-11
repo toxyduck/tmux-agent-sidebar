@@ -95,7 +95,7 @@ fn build_tab_title(state: &AppState) -> Line<'static> {
     Line::from(vec![
         Span::styled("Activity", activity_style),
         Span::styled(" \u{2502} ", sep_style),
-        Span::styled("Git", git_style),
+        Span::styled("Git/Arc", git_style),
     ])
 }
 

@@ -28,7 +28,7 @@ pub use focus::{Focus, FocusState};
 pub use global::GlobalState;
 pub use layout::{
     FrameLayout, HyperlinkOverlay, NavigationTarget, RepoSpawnTarget, RowTarget, SpawnRemoveTarget,
-    SubagentTarget,
+    SubagentTarget, VcsBranchTarget,
 };
 pub(crate) use notices::debug_forced_display;
 pub use notices::{ClaudePluginNotice, NoticesCopyTarget, NoticesMissingHookGroup, NoticesState};
@@ -70,6 +70,8 @@ pub struct AppState {
     pub icons: StatusIcons,
     pub bottom_tab: BottomTab,
     pub git: crate::git::GitData,
+    /// All Git/Arc mounts represented by live agent panes.
+    pub vcs_entries: Vec<crate::git::VcsEntry>,
     pub pane_states: PaneRuntimeMap,
     /// External capability collector snapshots, keyed by original tmux pane.
     pub extensions: ExtensionsState,
@@ -268,6 +270,7 @@ impl AppState {
             icons: StatusIcons::default(),
             bottom_tab: BottomTab::Activity,
             git: crate::git::GitData::default(),
+            vcs_entries: Vec::new(),
             pane_states: PaneRuntimeMap::new(),
             extensions: ExtensionsState::load(),
             selected_subagent_target: None,

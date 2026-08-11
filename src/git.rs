@@ -29,6 +29,105 @@ pub struct GitData {
     pub pr_number: Option<String>,
 }
 
+/// A repository touched by one or more agent panes. `root` is the VCS root,
+/// never a pane cwd, so worktree subdirectories collapse into one row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VcsEntry {
+    pub kind: VcsKind,
+    pub root: String,
+    pub branch: String,
+    pub diff_stat: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcsKind {
+    Git,
+    Arc,
+}
+
+impl VcsKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Git => "Git",
+            Self::Arc => "Arc",
+        }
+    }
+}
+
+/// Detect the VCS at `path`. Arc is tested first: an Arc mount can contain a
+/// git metadata directory but must never be queried with git commands.
+pub fn fetch_vcs_entry(path: &str) -> Option<VcsEntry> {
+    if let Some(root) = run_command(path, "arc", &["root"]) {
+        let branch = run_command(&root, "arc", &["branch"]).unwrap_or_else(|| "(no branch)".into());
+        let diff_stat = run_command(&root, "arc", &["diff", "--stat", "--no-color", "--git"])
+            .as_deref()
+            .and_then(parse_diff_stat);
+        return Some(VcsEntry {
+            kind: VcsKind::Arc,
+            root,
+            branch,
+            diff_stat,
+        });
+    }
+    let root = run_git(path, &["rev-parse", "--show-toplevel"])?;
+    let branch =
+        run_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "HEAD".into());
+    let diff_stat = run_git(&root, &["diff", "--shortstat"])
+        .as_deref()
+        .and_then(parse_diff_stat);
+    Some(VcsEntry {
+        kind: VcsKind::Git,
+        root,
+        branch,
+        diff_stat,
+    })
+}
+
+/// Fetch every distinct VCS root/branch currently represented by agent panes.
+pub fn fetch_vcs_entries(paths: impl IntoIterator<Item = String>) -> Vec<VcsEntry> {
+    let mut entries: Vec<_> = paths
+        .into_iter()
+        .filter_map(|path| fetch_vcs_entry(&path))
+        .collect();
+    entries.sort_by(|a, b| {
+        (a.root.as_str(), a.branch.as_str()).cmp(&(b.root.as_str(), b.branch.as_str()))
+    });
+    entries.dedup_by(|a, b| a.kind == b.kind && a.root == b.root && a.branch == b.branch);
+    entries
+}
+
+/// Current patch for a repository. Git includes both index and worktree
+/// changes; Arc delegates patch generation to `arc diff --git`.
+pub fn vcs_patch(kind: VcsKind, root: &str) -> Result<String, String> {
+    match kind {
+        VcsKind::Git => {
+            let staged =
+                run_command(root, "git", &["diff", "--cached", "--no-color"]).unwrap_or_default();
+            let unstaged = run_command(root, "git", &["diff", "--no-color"]).unwrap_or_default();
+            Ok([staged, unstaged]
+                .into_iter()
+                .filter(|patch| !patch.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        VcsKind::Arc => run_command(root, "arc", &["diff", "--no-color", "--git"])
+            .ok_or_else(|| "arc diff failed".to_string()),
+    }
+}
+
+fn run_command(path: &str, program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
 impl GitData {
     pub fn changed_file_count(&self) -> usize {
         self.staged_files.len() + self.unstaged_files.len() + self.untracked_files.len()

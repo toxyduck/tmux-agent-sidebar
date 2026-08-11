@@ -25,6 +25,7 @@ pub fn run(args: &[String]) -> Option<i32> {
         "set-status" => cmd_set_status(rest),
         "spawn" => spawn::cmd_spawn(rest),
         "capture" => capture::cmd_capture(rest),
+        "view-patch" => crate::diff_viewer::cmd_view_patch(),
         "--version" | "version" => {
             println!("{}", crate::VERSION);
             0

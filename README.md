@@ -37,6 +37,21 @@ OpenCode uses a small local plugin bridge instead of per-event hook config. The 
 - [TPM](https://github.com/tmux-plugins/tpm) (or the manual install in [Installation](https://hiroppy.github.io/tmux-agent-sidebar/getting-started/installation/))
 - [GitHub CLI](https://cli.github.com/) (optional — required only for PR numbers in the Git tab)
 
+### Git/Arc diff viewer
+
+The `Git/Arc` tab lists every VCS mount represented by a live agent pane. Click
+a branch row to open its current patch in a full-screen tmux popup. The viewer
+is injected by tmux configuration; the sidebar does not install or depend on a
+specific viewer:
+
+```tmux
+set -g @sidebar_diff_viewer_command '["hunk","patch","-"]'
+```
+
+The option must be a JSON argv array. The sidebar sends the generated patch to
+the command's standard input and reports an invalid, missing, or unavailable
+viewer in the sidebar/popup rather than failing the TUI.
+
 ## Quick Start
 
 ### 1. Install the plugin

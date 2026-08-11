@@ -40,6 +40,43 @@ pub(super) fn draw_git_content(frame: &mut Frame, state: &mut AppState, inner: R
     let theme = &state.theme;
     let inner_w = inner.width as usize;
 
+    state.layout.vcs_branch_targets.clear();
+    if !state.vcs_entries.is_empty() {
+        let mut lines = Vec::new();
+        for entry in &state.vcs_entries {
+            let summary = entry
+                .diff_stat
+                .map(|(add, del)| format!("  +{add}/-{del}"))
+                .unwrap_or_else(|| "  clean".into());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{} ", entry.kind.label()),
+                    Style::default().fg(theme.text_muted),
+                ),
+                Span::styled(entry.branch.clone(), Style::default().fg(theme.branch)),
+                Span::styled(summary, Style::default().fg(theme.text_muted)),
+            ]));
+        }
+        let visible = inner.height.min(lines.len() as u16);
+        for (index, entry) in state.vcs_entries.iter().take(visible as usize).enumerate() {
+            state
+                .layout
+                .vcs_branch_targets
+                .push(crate::state::VcsBranchTarget {
+                    rect: Rect::new(inner.x, inner.y + index as u16, inner.width, 1),
+                    kind: entry.kind,
+                    root: entry.root.clone(),
+                });
+        }
+        state.scrolls.git.total_lines = lines.len();
+        state.scrolls.git.visible_height = inner.height as usize;
+        frame.render_widget(
+            Paragraph::new(lines).scroll((state.scrolls.git.offset as u16, 0)),
+            inner,
+        );
+        return;
+    }
+
     // No git data loaded yet
     if state.git.branch.is_empty()
         && state.git.staged_files.is_empty()

@@ -36,6 +36,21 @@ pub(super) fn handle_event(
                         // next refresh tick and the tab renders stale data.
                         git_tab_active
                             .store(state.bottom_tab == BottomTab::GitStatus, Ordering::Relaxed);
+                    } else if state.bottom_tab == BottomTab::GitStatus
+                        && let Some(target) = state
+                            .layout
+                            .vcs_branch_targets
+                            .iter()
+                            .find(|target| {
+                                target.rect.contains(ratatui::layout::Position {
+                                    x: mouse.column,
+                                    y: mouse.row,
+                                })
+                            })
+                            .cloned()
+                        && let Err(error) = crate::diff_viewer::open_popup(target.kind, target.root)
+                    {
+                        state.set_flash(format!("Diff viewer unavailable: {error}"));
                     }
                 }
                 MouseEventKind::ScrollDown => {

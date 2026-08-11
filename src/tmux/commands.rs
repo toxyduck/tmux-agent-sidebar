@@ -30,6 +30,10 @@ pub fn run_tmux_capture(args: &[&str]) -> Result<String, String> {
 }
 
 pub fn display_message(target: &str, format: &str) -> String {
+    #[cfg(test)]
+    if let Some(value) = crate::tmux::test_mock::intercept_display_message(target, format) {
+        return value;
+    }
     run_tmux(&["display-message", "-t", target, "-p", format])
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
@@ -96,7 +100,7 @@ pub fn kill_window(window_id: &str) -> Result<(), String> {
 
 pub fn select_pane(pane_id: &str) {
     #[cfg(test)]
-    if crate::tmux::test_mock::intercept_select_pane() {
+    if crate::tmux::test_mock::intercept_select_pane(pane_id) {
         return;
     }
     // Find the session containing this pane and switch to it first

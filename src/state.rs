@@ -185,6 +185,13 @@ impl AppState {
             }
             return;
         }
+        let (cwd, pane_pid, current_command) = match self.fresh_native_activation_context(&target) {
+            Ok(context) => context,
+            Err(error) => {
+                self.set_flash(format!("Native viewer unavailable: {error}"));
+                return;
+            }
+        };
         let request_id = match self.extensions.reserve_native_activation(&target) {
             Ok(None) => return,
             Ok(Some(request_id)) => request_id,
@@ -194,13 +201,12 @@ impl AppState {
             }
         };
         crate::tmux::select_pane(&target.parent_pane_id);
-        let (_, cwd, pane_pid, current_command) = self.pane_context(&target.parent_pane_id);
         if let Err(error) = self.extensions.dispatch_native_activation(
             request_id,
             target,
-            cwd,
-            pane_pid,
-            current_command,
+            Some(cwd),
+            Some(pane_pid),
+            Some(current_command),
         ) {
             self.set_flash(format!("Native viewer unavailable: {error}"));
         }
@@ -250,6 +256,52 @@ impl AppState {
             pane.pane_pid,
             (!pane.current_command.is_empty()).then(|| pane.current_command.clone()),
         )
+    }
+
+    /// Read the activation context directly from tmux immediately before
+    /// taking focus and enqueueing a native provider request. Cached
+    /// `PaneInfo` is deliberately not used here: an agent may have restarted
+    /// in the same pane between the last refresh and a click.
+    fn fresh_native_activation_context(
+        &self,
+        target: &SubagentTarget,
+    ) -> Result<(String, u32, String), String> {
+        let expected_session = target
+            .session_id
+            .as_deref()
+            .filter(|session_id| !session_id.is_empty())
+            .ok_or_else(|| "target session is unavailable".to_string())?;
+        let output = crate::tmux::display_message(
+            &target.parent_pane_id,
+            "#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{@pane_session_id}\t#{@pane_agent}",
+        );
+        let fields: Vec<&str> = output.split('\t').collect();
+        if fields.len() != 5 {
+            return Err("target pane context is unavailable".to_string());
+        }
+        let pane_pid = fields[0]
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid != 0)
+            .ok_or_else(|| "target pane pid is unavailable".to_string())?;
+        let current_command = fields[1].trim();
+        if current_command.is_empty() {
+            return Err("target pane command is unavailable".to_string());
+        }
+        let session_id = fields[3].trim();
+        if session_id != expected_session {
+            return Err("target pane session changed".to_string());
+        }
+        let provider = fields[4].trim();
+        if provider != target.provider_id {
+            return Err("target pane provider changed".to_string());
+        }
+        let cwd = std::fs::canonicalize(fields[2].trim())
+            .map_err(|_| "target pane path is unavailable".to_string())?
+            .to_string_lossy()
+            .into_owned();
+        Ok((cwd, pane_pid, current_command.to_string()))
     }
 
     fn subagent_target_matches_live_inspection(&self, target: &SubagentTarget) -> bool {

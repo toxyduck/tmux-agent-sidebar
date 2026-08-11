@@ -339,6 +339,18 @@ mod tests {
         SubagentTarget,
         TreeTarget,
     ) {
+        activation_ready_state_for("claude", AgentType::Claude)
+    }
+
+    fn activation_ready_state_for(
+        provider: &str,
+        agent: AgentType,
+    ) -> (
+        AppState,
+        crate::state::TestControlQueue,
+        SubagentTarget,
+        TreeTarget,
+    ) {
         let cwd = std::env::temp_dir()
             .canonicalize()
             .unwrap()
@@ -349,7 +361,7 @@ mod tests {
             pane_active: true,
             status: PaneStatus::Running,
             attention: false,
-            agent: AgentType::Claude,
+            agent,
             path: cwd,
             current_command: "claude".into(),
             prompt: String::new(),
@@ -374,7 +386,7 @@ mod tests {
         let (extensions, queue) =
             crate::state::ExtensionsState::with_test_control_queue(ExtensionsConfig {
                 providers: BTreeMap::from([(
-                    "claude".into(),
+                    provider.into(),
                     ProviderConfig {
                         argv: vec!["/bin/true".into()],
                         timeout_ms: 100,
@@ -386,7 +398,7 @@ mod tests {
         state.extensions = extensions;
         state.extensions.seed_test_inspection(
             "%1",
-            "claude",
+            provider,
             Some("session"),
             Reply {
                 version: 1,
@@ -424,14 +436,22 @@ mod tests {
         );
         let subagent = SubagentTarget {
             parent_pane_id: "%1".into(),
-            provider_id: "claude".into(),
+            provider_id: provider.into(),
             session_id: Some("session".into()),
             agent_id: "child".into(),
             node_id: "child".into(),
         };
+        crate::tmux::test_mock::set_display_message(
+            "%1",
+            "#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{@pane_session_id}\t#{@pane_agent}",
+            &format!(
+                "4242\tclaude\t{}\tsession\t{provider}",
+                state.repo_groups[0].panes[0].0.path
+            ),
+        );
         let capability = TreeTarget {
             parent_pane_id: "%1".into(),
-            provider_id: "claude".into(),
+            provider_id: provider.into(),
             session_id: Some("session".into()),
             agent_id: "child".into(),
             node_id: "skills".into(),
@@ -468,8 +488,132 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(mouse_request.cwd.as_deref(), Some(expected_cwd.as_str()));
-        assert_eq!(mouse_request.pane_pid, Some(42));
+        assert_eq!(mouse_request.pane_pid, Some(4242));
         assert_eq!(mouse_request.current_command.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn activation_uses_fresh_tmux_context_instead_of_cached_pane_info() {
+        let _guard = crate::tmux::test_mock::install();
+        let (mut state, queue, subagent, _) = activation_ready_state();
+        let fresh_cwd = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let cached = &mut state.repo_groups[0].panes[0].0;
+        cached.pane_pid = Some(7);
+        cached.current_command = "old-command".into();
+        cached.path = "/stale/path".into();
+        crate::tmux::test_mock::set_display_message(
+            "%1",
+            "#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{@pane_session_id}\t#{@pane_agent}",
+            &format!("777\tfish\t{fresh_cwd}\tsession\tclaude"),
+        );
+
+        state.activate_subagent(subagent);
+
+        let request = queue.take_activation().expect("fresh activation request");
+        assert_eq!(request.cwd.as_deref(), Some(fresh_cwd.as_str()));
+        assert_eq!(request.pane_pid, Some(777));
+        assert_eq!(request.current_command.as_deref(), Some("fish"));
+    }
+
+    #[test]
+    fn activation_passes_fresh_codex_shell_command_without_provider_equality() {
+        let _guard = crate::tmux::test_mock::install();
+        let cwd = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        for command in ["zsh", "pwsh"] {
+            let (mut state, queue, subagent, _) =
+                activation_ready_state_for("codex", AgentType::Codex);
+            crate::tmux::test_mock::set_display_message(
+                "%1",
+                "#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{@pane_session_id}\t#{@pane_agent}",
+                &format!("4242\t{command}\t{cwd}\tsession\tcodex"),
+            );
+
+            state.activate_subagent(subagent);
+
+            let request = queue.take_activation().expect("Codex activation request");
+            assert_eq!(request.current_command.as_deref(), Some(command));
+        }
+    }
+
+    #[test]
+    fn activation_rejects_fresh_provider_or_session_mismatch_before_enqueue() {
+        let _guard = crate::tmux::test_mock::install();
+        let (mut state, queue, subagent, _) = activation_ready_state();
+        let cwd = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::tmux::test_mock::set_display_message(
+            "%1",
+            "#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{@pane_session_id}\t#{@pane_agent}",
+            &format!("4242\tclaude\t{cwd}\tother-session\tclaude"),
+        );
+
+        state.activate_subagent(subagent);
+
+        assert!(queue.take_activation().is_none());
+        assert!(crate::tmux::test_mock::selected_panes().is_empty());
+        assert_eq!(
+            state.flash.as_ref().map(|(message, _)| message.as_str()),
+            Some("Native viewer unavailable: target pane session changed")
+        );
+    }
+
+    #[test]
+    fn activation_rejects_fresh_provider_mismatch_before_focus_or_enqueue() {
+        let _guard = crate::tmux::test_mock::install();
+        let (mut state, queue, subagent, _) = activation_ready_state();
+        let cwd = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        crate::tmux::test_mock::set_display_message(
+            "%1",
+            "#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{@pane_session_id}\t#{@pane_agent}",
+            &format!("4242\tclaude\t{cwd}\tsession\tcodex"),
+        );
+
+        state.activate_subagent(subagent);
+
+        assert!(queue.take_activation().is_none());
+        assert!(crate::tmux::test_mock::selected_panes().is_empty());
+        assert_eq!(
+            state.flash.as_ref().map(|(message, _)| message.as_str()),
+            Some("Native viewer unavailable: target pane provider changed")
+        );
+    }
+
+    #[test]
+    fn activation_rejects_missing_fresh_tmux_context_before_enqueue() {
+        let _guard = crate::tmux::test_mock::install();
+        let (mut state, queue, subagent, _) = activation_ready_state();
+        // Replace the complete test context with the mock's empty response,
+        // which models a failed or stale tmux target query.
+        crate::tmux::test_mock::set_display_message(
+            "%1",
+            "#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{@pane_session_id}\t#{@pane_agent}",
+            "",
+        );
+
+        state.activate_subagent(subagent);
+
+        assert!(queue.take_activation().is_none());
+        assert!(crate::tmux::test_mock::selected_panes().is_empty());
+        assert_eq!(
+            state.flash.as_ref().map(|(message, _)| message.as_str()),
+            Some("Native viewer unavailable: target pane context is unavailable")
+        );
     }
 
     #[test]

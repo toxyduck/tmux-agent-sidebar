@@ -195,9 +195,12 @@ pub mod test_mock {
     use std::collections::HashMap;
 
     type Store = HashMap<(String, String), String>;
+    type DisplayStore = HashMap<(String, String), String>;
 
     thread_local! {
         static MOCK: RefCell<Option<Store>> = const { RefCell::new(None) };
+        static DISPLAY_MESSAGES: RefCell<Option<DisplayStore>> = const { RefCell::new(None) };
+        static SELECTED_PANES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
     }
 
     /// Install a fresh mock store for the current thread. Returns a guard
@@ -205,6 +208,8 @@ pub mod test_mock {
     /// state across each other.
     pub fn install() -> MockGuard {
         MOCK.with(|m| *m.borrow_mut() = Some(Store::new()));
+        DISPLAY_MESSAGES.with(|m| *m.borrow_mut() = Some(DisplayStore::new()));
+        SELECTED_PANES.with(|m| *m.borrow_mut() = Some(Vec::new()));
         MockGuard
     }
 
@@ -213,6 +218,8 @@ pub mod test_mock {
     impl Drop for MockGuard {
         fn drop(&mut self) {
             MOCK.with(|m| *m.borrow_mut() = None);
+            DISPLAY_MESSAGES.with(|m| *m.borrow_mut() = None);
+            SELECTED_PANES.with(|m| *m.borrow_mut() = None);
         }
     }
 
@@ -221,6 +228,17 @@ pub mod test_mock {
         MOCK.with(|m| {
             if let Some(store) = m.borrow_mut().as_mut() {
                 store.insert((pane.to_string(), key.to_string()), value.to_string());
+            }
+        });
+    }
+
+    /// Pre-populate a `display-message` response. Missing responses return
+    /// an empty string while the mock is installed, so tests never execute
+    /// real tmux commands.
+    pub fn set_display_message(pane: &str, format: &str, value: &str) {
+        DISPLAY_MESSAGES.with(|m| {
+            if let Some(store) = m.borrow_mut().as_mut() {
+                store.insert((pane.to_string(), format.to_string()), value.to_string());
             }
         });
     }
@@ -281,8 +299,32 @@ pub mod test_mock {
         })
     }
 
-    pub(crate) fn intercept_select_pane() -> bool {
-        MOCK.with(|m| m.borrow().is_some())
+    /// Pane focus attempts observed by the mock. An empty list proves an
+    /// activation failed before it could change the user's active pane.
+    pub fn selected_panes() -> Vec<String> {
+        SELECTED_PANES.with(|m| m.borrow().as_ref().cloned().unwrap_or_default())
+    }
+
+    pub(crate) fn intercept_select_pane(pane: &str) -> bool {
+        SELECTED_PANES.with(|m| {
+            if let Some(panes) = m.borrow_mut().as_mut() {
+                panes.push(pane.to_string());
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    pub(crate) fn intercept_display_message(pane: &str, format: &str) -> Option<String> {
+        DISPLAY_MESSAGES.with(|m| {
+            m.borrow().as_ref().map(|store| {
+                store
+                    .get(&(pane.to_string(), format.to_string()))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+        })
     }
 }
 

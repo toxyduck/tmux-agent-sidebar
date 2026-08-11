@@ -11,6 +11,9 @@ use crate::extension::{self, Detail, ExtensionsConfig, Inspection, Reply};
 pub struct TreeTarget {
     pub parent_pane_id: String,
     pub provider_id: String,
+    /// Session identity comes from the inspected tmux pane. It scopes
+    /// disclosure state so a recycled pane id cannot inherit old UI state.
+    pub session_id: Option<String>,
     pub agent_id: String,
     pub node_id: String,
     pub detail_token: Option<String>,
@@ -38,26 +41,95 @@ pub struct DetailView {
 
 #[derive(Debug, Default)]
 pub struct CapabilityUiState {
-    pub expanded: HashSet<String>,
+    expanded: HashSet<DisclosureKey>,
     pub selected: Option<TreeTarget>,
     pub detail: Option<DetailView>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DisclosureKey {
+    provider_id: String,
+    parent_pane_id: String,
+    session_id: Option<String>,
+    agent_id: String,
+    node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PaneScopeKey {
+    provider_id: String,
+    parent_pane_id: String,
+    session_id: Option<String>,
+}
+
 impl CapabilityUiState {
-    pub fn key(pane_id: &str, node_id: &str) -> String {
-        format!("{pane_id}:{node_id}")
+    fn key(target: &TreeTarget) -> DisclosureKey {
+        DisclosureKey {
+            provider_id: target.provider_id.clone(),
+            parent_pane_id: target.parent_pane_id.clone(),
+            session_id: target.session_id.clone(),
+            agent_id: target.agent_id.clone(),
+            node_id: target.node_id.clone(),
+        }
     }
 
-    pub fn is_expanded(&self, pane_id: &str, node_id: &str) -> bool {
-        self.expanded.contains(&Self::key(pane_id, node_id))
+    pub fn is_expanded(&self, target: &TreeTarget) -> bool {
+        self.expanded.contains(&Self::key(target))
     }
 
     pub fn toggle(&mut self, target: &TreeTarget) {
-        let key = Self::key(&target.parent_pane_id, &target.node_id);
+        let key = Self::key(target);
         if !self.expanded.insert(key.clone()) {
             self.expanded.remove(&key);
         }
         self.selected = Some(target.clone());
+    }
+
+    pub(crate) fn is_expanded_scope(
+        &self,
+        provider_id: &str,
+        pane_id: &str,
+        session_id: Option<&str>,
+        agent_id: &str,
+        node_id: &str,
+    ) -> bool {
+        self.expanded.contains(&DisclosureKey {
+            provider_id: provider_id.to_string(),
+            parent_pane_id: pane_id.to_string(),
+            session_id: session_id.map(str::to_string),
+            agent_id: agent_id.to_string(),
+            node_id: node_id.to_string(),
+        })
+    }
+
+    fn reconcile_scope(&mut self, key: &CacheKey, reply: &Reply) {
+        let available: HashSet<(&str, &str)> = reply
+            .tree
+            .iter()
+            .map(|node| (node.agent_id.as_str(), node.id.as_str()))
+            .chain(
+                reply
+                    .builtins
+                    .iter()
+                    .map(|summary| (summary.agent_id.as_str(), "__builtins__")),
+            )
+            .collect();
+        self.expanded.retain(|expanded| {
+            expanded.provider_id != key.provider
+                || expanded.parent_pane_id != key.pane_id
+                || expanded.session_id != key.session_id
+                || available.contains(&(expanded.agent_id.as_str(), expanded.node_id.as_str()))
+        });
+    }
+
+    fn prune_dead_scopes(&mut self, live_scopes: &HashSet<PaneScopeKey>) {
+        self.expanded.retain(|expanded| {
+            live_scopes.contains(&PaneScopeKey {
+                provider_id: expanded.provider_id.clone(),
+                parent_pane_id: expanded.parent_pane_id.clone(),
+                session_id: expanded.session_id.clone(),
+            })
+        });
     }
 }
 
@@ -184,6 +256,16 @@ impl ExtensionsState {
         >,
     ) {
         self.reload_config(false);
+        let panes: Vec<_> = panes.collect();
+        let live_scopes: HashSet<_> = panes
+            .iter()
+            .map(|(pane_id, provider, session_id, ..)| PaneScopeKey {
+                provider_id: provider.clone(),
+                parent_pane_id: pane_id.clone(),
+                session_id: session_id.clone(),
+            })
+            .collect();
+        self.ui.prune_dead_scopes(&live_scopes);
         if self.last_refresh.elapsed() < Duration::from_secs(2) {
             return;
         }
@@ -267,6 +349,7 @@ impl ExtensionsState {
                 self.in_flight.remove(key);
                 match result {
                     Ok(reply) => {
+                        self.ui.reconcile_scope(key, reply);
                         self.cache.insert(
                             key.clone(),
                             Inspection {
@@ -402,10 +485,109 @@ fn worker_loop(rx: Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerResult>) {
 mod tests {
     use super::*;
 
+    fn disclosure_target(
+        provider_id: &str,
+        pane_id: &str,
+        session_id: Option<&str>,
+        agent_id: &str,
+        node_id: &str,
+    ) -> TreeTarget {
+        TreeTarget {
+            parent_pane_id: pane_id.into(),
+            provider_id: provider_id.into(),
+            session_id: session_id.map(str::to_string),
+            agent_id: agent_id.into(),
+            node_id: node_id.into(),
+            detail_token: None,
+            inline_detail: None,
+            is_disclosure: true,
+        }
+    }
+
     #[test]
     fn cache_key_keeps_session_snapshots_separate() {
         let first = CacheKey::new("claude", "%1", Some("one"));
         let second = CacheKey::new("claude", "%1", Some("two"));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn disclosure_survives_switching_between_live_panes() {
+        let first = disclosure_target("claude", "%1", Some("one"), "main", "skills");
+        let second = disclosure_target("claude", "%2", Some("two"), "main", "skills");
+        let mut ui = CapabilityUiState::default();
+
+        ui.toggle(&first);
+        assert!(ui.is_expanded(&first));
+        ui.toggle(&second);
+        assert!(ui.is_expanded(&second));
+        assert!(ui.is_expanded(&first));
+    }
+
+    #[test]
+    fn disclosure_key_separates_provider_pane_session_and_agent() {
+        let targets = [
+            disclosure_target("claude", "%1", None, "main", "skills"),
+            disclosure_target("codex", "%1", None, "main", "skills"),
+            disclosure_target("claude", "%2", None, "main", "skills"),
+            disclosure_target("claude", "%1", Some("one"), "main", "skills"),
+            disclosure_target("claude", "%1", None, "subagent", "skills"),
+        ];
+        let mut ui = CapabilityUiState::default();
+        for target in &targets {
+            ui.toggle(target);
+        }
+        assert!(targets.iter().all(|target| ui.is_expanded(target)));
+
+        ui.toggle(&targets[0]);
+        assert!(!ui.is_expanded(&targets[0]));
+        assert!(targets[1..].iter().all(|target| ui.is_expanded(target)));
+    }
+
+    #[test]
+    fn replaced_session_drops_old_disclosure_from_live_snapshot() {
+        let old = disclosure_target("claude", "%1", Some("old"), "main", "skills");
+        let new = disclosure_target("claude", "%1", Some("new"), "main", "skills");
+        let mut ui = CapabilityUiState::default();
+        ui.toggle(&old);
+        ui.prune_dead_scopes(&HashSet::from([PaneScopeKey {
+            provider_id: "claude".into(),
+            parent_pane_id: "%1".into(),
+            session_id: Some("new".into()),
+        }]));
+
+        assert!(!ui.is_expanded(&old));
+        assert!(!ui.is_expanded(&new));
+    }
+
+    #[test]
+    fn successful_inspect_prunes_only_missing_nodes_in_its_exact_scope() {
+        let retained = disclosure_target("claude", "%1", Some("one"), "main", "skills");
+        let removed = disclosure_target("claude", "%1", Some("one"), "main", "tools");
+        let other_pane = disclosure_target("claude", "%2", Some("one"), "main", "tools");
+        let mut ui = CapabilityUiState::default();
+        ui.toggle(&retained);
+        ui.toggle(&removed);
+        ui.toggle(&other_pane);
+        ui.reconcile_scope(
+            &CacheKey::new("claude", "%1", Some("one")),
+            &Reply {
+                version: 1,
+                tree: vec![crate::extension::TreeNode {
+                    id: "skills".into(),
+                    agent_id: "main".into(),
+                    parent_id: None,
+                    label: "Skills".into(),
+                    fact_ids: vec![],
+                    detail_token: None,
+                    category: "skills".into(),
+                }],
+                ..Reply::default()
+            },
+        );
+
+        assert!(ui.is_expanded(&retained));
+        assert!(!ui.is_expanded(&removed));
+        assert!(ui.is_expanded(&other_pane));
     }
 }

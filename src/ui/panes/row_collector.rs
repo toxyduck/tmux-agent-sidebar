@@ -18,8 +18,8 @@ pub(super) struct CollectedRows {
     pub pending_tree: Vec<(usize, TreeTarget)>,
 }
 
-fn agent_role_label(agent: &crate::extension::AgentNode) -> String {
-    format!("{} · {}", agent.role.display_name(), agent.label)
+fn agent_label(agent: &crate::extension::AgentNode) -> &str {
+    &agent.label
 }
 
 pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
@@ -141,7 +141,7 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                             .map(|model| format!("  {model}"))
                             .unwrap_or_default();
                         pane_lines.push(Line::from(Span::styled(
-                            format!("  └ {}{model}", agent_role_label(agent)),
+                            format!("  └ {}{model}", agent_label(agent)),
                             Style::default().fg(theme.subagent),
                         )));
                         if agent.parent_id.is_some() {
@@ -168,6 +168,7 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                     state.extensions.config.as_ref(),
                     &pane.pane_id,
                     pane.agent.as_str(),
+                    pane.session_id.as_deref(),
                     state
                         .selected_subagent_target
                         .as_ref()
@@ -262,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_role_label_never_renders_a_naked_name() {
+    fn agent_label_renders_semantic_label_verbatim() {
         let main = AgentNode {
             id: "main".into(),
             parent_id: None,
@@ -285,9 +286,9 @@ mod tests {
             model: None,
         };
 
-        assert_eq!(agent_role_label(&main), "Main · Ada");
-        assert_eq!(agent_role_label(&subagent), "Subagent · Ada");
-        assert_eq!(agent_role_label(&unknown), "Unknown · Ada");
+        assert_eq!(agent_label(&main), "Ada");
+        assert_eq!(agent_label(&subagent), "Ada");
+        assert_eq!(agent_label(&unknown), "Ada");
     }
 
     #[test]

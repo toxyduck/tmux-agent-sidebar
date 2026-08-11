@@ -715,6 +715,7 @@ mod tests {
         let target = TreeTarget {
             parent_pane_id: "%1".into(),
             provider_id: "claude".into(),
+            session_id: None,
             agent_id: "agent".into(),
             node_id: "skill:review".into(),
             detail_token: None,

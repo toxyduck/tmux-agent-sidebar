@@ -1421,6 +1421,7 @@ mod tests {
         let target = TreeTarget {
             parent_pane_id: "%1".into(),
             provider_id: "claude".into(),
+            session_id: None,
             agent_id: "agent".into(),
             node_id: "__builtins__".into(),
             detail_token: None,
@@ -1430,7 +1431,7 @@ mod tests {
         state.layout.tree_line_targets.insert(0, target.clone());
         state.handle_mouse_click(2, 5);
 
-        assert!(state.extensions.ui.is_expanded("%1", "__builtins__"));
+        assert!(state.extensions.ui.is_expanded(&target));
         assert_eq!(state.extensions.ui.selected, Some(target));
     }
 

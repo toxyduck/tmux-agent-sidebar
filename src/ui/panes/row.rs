@@ -35,6 +35,7 @@ pub(super) fn render_extension_tree(
     config: Option<&crate::extension::ExtensionsConfig>,
     pane_id: &str,
     provider_id: &str,
+    session_id: Option<&str>,
     selected_agent_id: Option<&str>,
     ui: &CapabilityUiState,
     width: usize,
@@ -116,6 +117,7 @@ pub(super) fn render_extension_tree(
         let target = TreeTarget {
             parent_pane_id: pane_id.to_string(),
             provider_id: provider_id.to_string(),
+            session_id: session_id.map(str::to_string),
             agent_id: fact.agent_id.clone(),
             node_id: format!("fact:{}", fact.id),
             detail_token: fact.detail_token.clone(),
@@ -149,10 +151,15 @@ pub(super) fn render_extension_tree(
             ancestors.push(parent_node.id.as_str());
             parent = parent_node.parent_id.as_deref();
         }
-        if ancestors
-            .iter()
-            .any(|ancestor| !ui.is_expanded(pane_id, ancestor))
-        {
+        if ancestors.iter().any(|ancestor| {
+            !ui.is_expanded_scope(
+                provider_id,
+                pane_id,
+                session_id,
+                selected_agent_id,
+                ancestor,
+            )
+        }) {
             continue;
         }
         let has_children = inspection.reply.tree.iter().any(|candidate| {
@@ -160,7 +167,13 @@ pub(super) fn render_extension_tree(
                 && candidate.parent_id.as_deref() == Some(node.id.as_str())
         });
         let has_content = has_children || !node.fact_ids.is_empty();
-        let expanded = ui.is_expanded(pane_id, &node.id);
+        let expanded = ui.is_expanded_scope(
+            provider_id,
+            pane_id,
+            session_id,
+            selected_agent_id,
+            &node.id,
+        );
         let disclosure = if has_content {
             if expanded { "▼" } else { "▶" }
         } else {
@@ -183,6 +196,7 @@ pub(super) fn render_extension_tree(
             TreeTarget {
                 parent_pane_id: pane_id.to_string(),
                 provider_id: provider_id.to_string(),
+                session_id: session_id.map(str::to_string),
                 agent_id: node.agent_id.clone(),
                 node_id: node.id.clone(),
                 detail_token: node.detail_token.clone(),
@@ -215,7 +229,13 @@ pub(super) fn render_extension_tree(
         && !is_hidden(config, "builtins")
     {
         let builtins_id = "__builtins__";
-        let expanded = ui.is_expanded(pane_id, builtins_id);
+        let expanded = ui.is_expanded_scope(
+            provider_id,
+            pane_id,
+            session_id,
+            selected_agent_id,
+            builtins_id,
+        );
         let exceptions: Vec<_> = builtins
             .exceptions
             .iter()
@@ -249,6 +269,7 @@ pub(super) fn render_extension_tree(
             TreeTarget {
                 parent_pane_id: pane_id.to_string(),
                 provider_id: provider_id.to_string(),
+                session_id: session_id.map(str::to_string),
                 agent_id: builtins.agent_id.clone(),
                 node_id: builtins_id.to_string(),
                 detail_token: None,
@@ -287,6 +308,7 @@ pub(super) fn render_extension_tree(
                     TreeTarget {
                         parent_pane_id: pane_id.to_string(),
                         provider_id: provider_id.to_string(),
+                        session_id: session_id.map(str::to_string),
                         agent_id: builtins.agent_id.clone(),
                         node_id: format!("builtin:{}:{}", builtins.agent_id, item.id),
                         detail_token: None,
@@ -320,6 +342,7 @@ pub(super) fn render_extension_tree(
                 TreeTarget {
                     parent_pane_id: pane_id.to_string(),
                     provider_id: provider_id.to_string(),
+                    session_id: session_id.map(str::to_string),
                     agent_id: selected_agent_id.to_string(),
                     node_id: format!("slot:{}", slot.id),
                     detail_token: None,
@@ -339,6 +362,7 @@ pub(super) fn render_extension_tree(
             TreeTarget {
                 parent_pane_id: pane_id.to_string(),
                 provider_id: provider_id.to_string(),
+                session_id: session_id.map(str::to_string),
                 agent_id: selected_agent_id.to_string(),
                 node_id: "__stale__".into(),
                 detail_token: None,
@@ -357,6 +381,7 @@ pub(super) fn render_extension_tree(
             TreeTarget {
                 parent_pane_id: pane_id.to_string(),
                 provider_id: provider_id.to_string(),
+                session_id: session_id.map(str::to_string),
                 agent_id: selected_agent_id.to_string(),
                 node_id: "__error__".into(),
                 detail_token: None,
@@ -585,6 +610,7 @@ mod tests {
             }),
             "%1",
             "claude",
+            None,
             Some("agent-1"),
             &ui,
             60,
@@ -609,6 +635,7 @@ mod tests {
             }),
             "%1",
             "claude",
+            None,
             Some("agent-1"),
             &ui,
             60,
@@ -697,6 +724,7 @@ mod tests {
                 Some(&config),
                 "%1",
                 "claude",
+                None,
                 Some("agent"),
                 &ui,
                 60,
@@ -713,6 +741,7 @@ mod tests {
             Some(&config),
             "%1",
             "claude",
+            None,
             Some("agent"),
             &ui,
             60,
@@ -766,6 +795,7 @@ mod tests {
             Some(&config),
             "%1",
             "claude",
+            None,
             Some("agent"),
             &ui,
             60,
@@ -804,6 +834,7 @@ mod tests {
             Some(&config),
             "%1",
             "claude",
+            None,
             Some("agent"),
             &ui,
             60,
@@ -892,6 +923,7 @@ mod tests {
             }),
             "%1",
             "claude",
+            None,
             Some("child"),
             &ui,
             18,
@@ -907,6 +939,7 @@ mod tests {
             }),
             "%1",
             "claude",
+            None,
             Some("child"),
             &ui,
             18,
@@ -985,6 +1018,7 @@ mod tests {
             Some(&config),
             "%1",
             "claude",
+            None,
             Some("agent"),
             &ui,
             12,
@@ -1003,6 +1037,7 @@ mod tests {
             Some(&config),
             "%1",
             "claude",
+            None,
             Some("agent"),
             &ui,
             60,

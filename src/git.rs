@@ -79,9 +79,18 @@ pub fn fetch_vcs_entry(path: &str) -> Option<VcsEntry> {
     let root = run_git(path, &["rev-parse", "--show-toplevel"])?;
     let branch =
         run_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|| "HEAD".into());
-    let diff_stat = run_git(&root, &["diff", "--shortstat"])
+    let unstaged = run_git(&root, &["diff", "--shortstat"])
         .as_deref()
-        .and_then(parse_diff_stat);
+        .and_then(parse_diff_stat)
+        .unwrap_or((0, 0));
+    let staged = run_git(&root, &["diff", "--cached", "--shortstat"])
+        .as_deref()
+        .and_then(parse_diff_stat)
+        .unwrap_or((0, 0));
+    let untracked = git_untracked_paths(&root)
+        .map(|paths| paths.len())
+        .unwrap_or(0);
+    let diff_stat = Some((unstaged.0 + staged.0 + untracked, unstaged.1 + staged.1));
     Some(VcsEntry {
         kind: VcsKind::Git,
         root,
@@ -142,14 +151,30 @@ pub fn vcs_patch_bytes(kind: VcsKind, root: &str) -> Result<Vec<u8>, String> {
                 root,
                 "arc",
                 &["diff", "--cached", "--no-color", "--git"],
-                true,
+                false,
             )?
             .stdout;
             patch.extend(
-                command_output(root, "arc", &["diff", "--no-color", "--git"], true)?.stdout,
+                command_output(root, "arc", &["diff", "--no-color", "--git"], false)?.stdout,
             );
             for path in arc_untracked_paths(root)? {
-                patch.extend(untracked_patch(root, &path)?);
+                patch.extend(
+                    git_output(
+                        root,
+                        &[
+                            "diff",
+                            "--no-index",
+                            "--no-color",
+                            "--binary",
+                            "--",
+                            "/dev/null",
+                            &path,
+                        ],
+                        true,
+                    )
+                    .map_err(|error| format!("cannot diff Arc untracked {path}: {error}"))?
+                    .stdout,
+                );
             }
             Ok(patch)
         }
@@ -250,20 +275,6 @@ fn arc_untracked_paths(root: &str) -> Result<Vec<String>, String> {
         .flatten()
         .filter_map(|value| value.as_str().map(str::to_owned))
         .collect())
-}
-
-fn untracked_patch(root: &str, path: &str) -> Result<Vec<u8>, String> {
-    let bytes =
-        std::fs::read(std::path::Path::new(root).join(path)).map_err(|error| error.to_string())?;
-    let lines = String::from_utf8_lossy(&bytes);
-    let count = lines.lines().count();
-    let mut patch = format!("diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{count} @@\n").into_bytes();
-    for line in lines.lines() {
-        patch.extend_from_slice(b"+");
-        patch.extend_from_slice(line.as_bytes());
-        patch.extend_from_slice(b"\n");
-    }
-    Ok(patch)
 }
 
 pub(crate) fn parse_arc_branch_json(text: &str) -> Option<String> {

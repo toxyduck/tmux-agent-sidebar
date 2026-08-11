@@ -18,6 +18,10 @@ pub(super) struct CollectedRows {
     pub pending_tree: Vec<(usize, TreeTarget)>,
 }
 
+fn agent_role_label(agent: &crate::extension::AgentNode) -> String {
+    format!("{} · {}", agent.role.display_name(), agent.label)
+}
+
 pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
     let width = width as usize;
     let theme = &state.theme;
@@ -129,12 +133,7 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                     pane.agent.as_str(),
                     pane.session_id.as_deref(),
                 ) {
-                    for agent in inspection
-                        .reply
-                        .agents
-                        .iter()
-                        .filter(|agent| agent.parent_id.is_some())
-                    {
+                    for agent in &inspection.reply.agents {
                         let line = collected.lines.len() + pane_lines.len();
                         let model = agent
                             .model
@@ -142,16 +141,18 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                             .map(|model| format!("  {model}"))
                             .unwrap_or_default();
                         pane_lines.push(Line::from(Span::styled(
-                            format!("  └ {}{model}", agent.label),
+                            format!("  └ {}{model}", agent_role_label(agent)),
                             Style::default().fg(theme.subagent),
                         )));
-                        collected.pending_subagents.push((
-                            line,
-                            pane.pane_id.clone(),
-                            pane.agent.as_str().to_string(),
-                            agent.id.clone(),
-                            agent.id.clone(),
-                        ));
+                        if agent.parent_id.is_some() {
+                            collected.pending_subagents.push((
+                                line,
+                                pane.pane_id.clone(),
+                                pane.agent.as_str().to_string(),
+                                agent.id.clone(),
+                                agent.id.clone(),
+                            ));
+                        }
                     }
                 }
                 // Capabilities are intentionally rendered only for the selected
@@ -231,6 +232,7 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extension::{AgentNode, AgentRole};
     use crate::group::{PaneGitInfo, RepoGroup};
     use crate::state::{AppState, StatusFilter};
     use crate::tmux::{AgentType, PaneInfo, PaneStatus, PermissionMode, WorktreeMetadata};
@@ -257,6 +259,35 @@ mod tests {
             sidebar_spawned: false,
             bg_shell_cmd: None,
         }
+    }
+
+    #[test]
+    fn agent_role_label_never_renders_a_naked_name() {
+        let main = AgentNode {
+            id: "main".into(),
+            parent_id: None,
+            label: "Ada".into(),
+            role: AgentRole::Main,
+            model: Some("model-a".into()),
+        };
+        let subagent = AgentNode {
+            id: "subagent".into(),
+            parent_id: Some("main".into()),
+            label: "Ada".into(),
+            role: AgentRole::Subagent,
+            model: None,
+        };
+        let unknown = AgentNode {
+            id: "unknown".into(),
+            parent_id: None,
+            label: "Ada".into(),
+            role: AgentRole::Unknown,
+            model: None,
+        };
+
+        assert_eq!(agent_role_label(&main), "Main · Ada");
+        assert_eq!(agent_role_label(&subagent), "Subagent · Ada");
+        assert_eq!(agent_role_label(&unknown), "Unknown · Ada");
     }
 
     #[test]

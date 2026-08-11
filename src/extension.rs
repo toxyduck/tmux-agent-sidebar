@@ -136,6 +136,29 @@ pub struct BuiltinItem {
 
 /// Provider-neutral identity. `id` is stable within `(provider, session_id)`;
 /// UI code must never fall back to a row number or a rendered label.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    Main,
+    Subagent,
+    Background,
+    Teammate,
+    #[default]
+    Unknown,
+}
+
+impl AgentRole {
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Main => "Main",
+            Self::Subagent => "Subagent",
+            Self::Background => "Background",
+            Self::Teammate => "Teammate",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentNode {
@@ -143,6 +166,10 @@ pub struct AgentNode {
     #[serde(default)]
     pub parent_id: Option<String>,
     pub label: String,
+    /// Provider-neutral execution role. Older collectors omit it and get the
+    /// explicit `Unknown` prefix instead of a misleading inferred role.
+    #[serde(default)]
+    pub role: AgentRole,
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -761,7 +788,18 @@ mod tests {
         )
         .unwrap();
         assert!(reply.builtins[0].items.is_empty());
+        assert_eq!(reply.agents[0].role, AgentRole::Unknown);
         validate_reply(&reply).unwrap();
+    }
+
+    #[test]
+    fn agent_role_uses_provider_neutral_wire_values() {
+        let reply: Reply = serde_json::from_str(
+            r#"{"version":1,"agents":[{"id":"main","label":"Ada","role":"main"},{"id":"sub","parent_id":"main","label":"Ada","role":"subagent"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(reply.agents[0].role, AgentRole::Main);
+        assert_eq!(reply.agents[1].role, AgentRole::Subagent);
     }
 
     #[cfg(unix)]
@@ -1019,12 +1057,14 @@ mod tests {
                 id: "a".into(),
                 parent_id: None,
                 label: "a".into(),
+                role: Default::default(),
                 model: None,
             },
             AgentNode {
                 id: "a".into(),
                 parent_id: None,
                 label: "b".into(),
+                role: Default::default(),
                 model: None,
             },
         ];
@@ -1039,6 +1079,7 @@ mod tests {
                 id: "agent".into(),
                 parent_id: None,
                 label: "agent".into(),
+                role: Default::default(),
                 model: None,
             }],
             tree: vec![
@@ -1075,12 +1116,14 @@ mod tests {
                     id: "one".into(),
                     parent_id: None,
                     label: "one".into(),
+                    role: Default::default(),
                     model: None,
                 },
                 AgentNode {
                     id: "two".into(),
                     parent_id: Some("one".into()),
                     label: "two".into(),
+                    role: Default::default(),
                     model: None,
                 },
             ],

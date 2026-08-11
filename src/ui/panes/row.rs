@@ -81,7 +81,20 @@ pub(super) fn render_extension_tree(
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect();
-    let mut referenced_facts = HashSet::new();
+    // Tree ownership is semantic, not a consequence of the current disclosure
+    // state. A collapsed or hidden tree must never leak its facts into the
+    // flat fallback area.
+    let referenced_facts: HashSet<_> = inspection
+        .reply
+        .tree
+        .iter()
+        .flat_map(|node| node.fact_ids.iter().map(String::as_str))
+        .collect();
+    let has_referenced_capabilities = inspection
+        .reply
+        .tree
+        .iter()
+        .any(|node| node.agent_id == selected_agent_id && !node.fact_ids.is_empty());
     let mut lines = Vec::new();
     let fact_line = |fact: &crate::extension::Fact, indent: usize| {
         let marker = match fact.evidence {
@@ -180,14 +193,17 @@ pub(super) fn render_extension_tree(
         if expanded {
             for fact_id in &node.fact_ids {
                 if let Some(fact) = facts_by_id.get(fact_id.as_str()) {
-                    referenced_facts.insert(fact.id.as_str());
                     lines.push(fact_line(fact, ancestors.len() + 1));
                 }
             }
         }
     }
     for fact in &facts {
-        if !referenced_facts.contains(fact.id.as_str()) {
+        // `used` is legacy third-party telemetry. It is useful only when a
+        // provider exposes no capability item that can carry the same evidence.
+        if !referenced_facts.contains(fact.id.as_str())
+            && (fact.category != "used" || !has_referenced_capabilities)
+        {
             lines.push(fact_line(fact, 0));
         }
     }
@@ -446,8 +462,8 @@ pub(super) fn render_pane_lines_with_ports(
 mod tests {
     use super::*;
     use crate::extension::{
-        AgentNode, BuiltinItem, BuiltinKind, BuiltinSummary, Evidence, ExtensionsConfig, Fact,
-        Inspection, Reply, TreeNode,
+        AgentNode, AgentRole, BuiltinItem, BuiltinKind, BuiltinSummary, Evidence, ExtensionsConfig,
+        Fact, Inspection, Reply, TreeNode,
     };
     use crate::group::PaneGitInfo;
     use crate::state::CapabilityUiState;
@@ -528,6 +544,7 @@ mod tests {
                     id: "agent-1".into(),
                     parent_id: None,
                     label: "agent".into(),
+                    role: Default::default(),
                     model: None,
                 }],
                 builtins: vec![crate::extension::BuiltinSummary {
@@ -606,6 +623,200 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_capabilities_never_fall_back_to_flat_or_used_rows() {
+        let facts: Vec<_> = (0..34)
+            .map(|index| Fact {
+                id: format!("skill-{index}"),
+                agent_id: "agent".into(),
+                category: "skills".into(),
+                label: format!("Skill {index}"),
+                detail: String::new(),
+                evidence: Evidence::Available,
+                source: "skills-source".into(),
+                detail_token: None,
+            })
+            .chain(std::iter::once(Fact {
+                id: "legacy-used".into(),
+                agent_id: "agent".into(),
+                category: "used".into(),
+                label: "Used: Skill 0".into(),
+                detail: String::new(),
+                evidence: Evidence::Observed,
+                source: "legacy-source".into(),
+                detail_token: None,
+            }))
+            .collect();
+        let inspection = Inspection {
+            stale: false,
+            reply: Reply {
+                version: 1,
+                agents: vec![AgentNode {
+                    id: "agent".into(),
+                    parent_id: None,
+                    label: "Ada".into(),
+                    role: AgentRole::Main,
+                    model: None,
+                }],
+                facts,
+                tree: vec![TreeNode {
+                    id: "skills".into(),
+                    agent_id: "agent".into(),
+                    parent_id: None,
+                    label: "Skills".into(),
+                    fact_ids: (0..34).map(|index| format!("skill-{index}")).collect(),
+                    detail_token: None,
+                    category: "skills".into(),
+                }],
+                builtins: vec![BuiltinSummary {
+                    agent_id: "agent".into(),
+                    tools_count: 6,
+                    skills_count: 34,
+                    exceptions: vec![],
+                    items: vec![BuiltinItem {
+                        id: "read".into(),
+                        name: "Read".into(),
+                        kind: BuiltinKind::Tool,
+                        description: None,
+                        evidence: Evidence::Available,
+                        exception: None,
+                    }],
+                }],
+                ..Reply::default()
+            },
+        };
+        let config = ExtensionsConfig {
+            version: 1,
+            ..ExtensionsConfig::default()
+        };
+        let ui = CapabilityUiState::default();
+        let expected_ids = vec!["skills".to_string(), "__builtins__".to_string()];
+
+        for _ in 0..30 {
+            let lines = render_extension_tree(
+                Some(&inspection),
+                Some(&config),
+                "%1",
+                "claude",
+                Some("agent"),
+                &ui,
+                60,
+                &ColorTheme::default(),
+            );
+            let ids: Vec<_> = lines
+                .iter()
+                .map(|(_, target)| target.node_id.clone())
+                .collect();
+            assert_eq!(ids, expected_ids);
+        }
+        let lines = render_extension_tree(
+            Some(&inspection),
+            Some(&config),
+            "%1",
+            "claude",
+            Some("agent"),
+            &ui,
+            60,
+            &ColorTheme::default(),
+        );
+        let rendered = lines
+            .iter()
+            .map(|(line, _)| line_text(line).trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        insta::assert_snapshot!(rendered, @r"
+  ▶ Skills
+  ▶ Built-ins: 6 tools, 34 skills
+");
+    }
+
+    #[test]
+    fn legacy_used_fact_renders_only_without_capability_item() {
+        let used = Fact {
+            id: "used".into(),
+            agent_id: "agent".into(),
+            category: "used".into(),
+            label: "Used: Read".into(),
+            detail: String::new(),
+            evidence: Evidence::Observed,
+            source: String::new(),
+            detail_token: None,
+        };
+        let mut reply = Reply {
+            version: 1,
+            agents: vec![AgentNode {
+                id: "agent".into(),
+                parent_id: None,
+                label: "Ada".into(),
+                role: AgentRole::Main,
+                model: None,
+            }],
+            facts: vec![used.clone()],
+            ..Reply::default()
+        };
+        let config = ExtensionsConfig {
+            version: 1,
+            ..ExtensionsConfig::default()
+        };
+        let ui = CapabilityUiState::default();
+        let without_capability = render_extension_tree(
+            Some(&Inspection {
+                stale: false,
+                reply: reply.clone(),
+            }),
+            Some(&config),
+            "%1",
+            "claude",
+            Some("agent"),
+            &ui,
+            60,
+            &ColorTheme::default(),
+        );
+        assert!(
+            without_capability
+                .iter()
+                .any(|(_, target)| target.node_id == "fact:used")
+        );
+
+        reply.facts.push(Fact {
+            id: "skill".into(),
+            agent_id: "agent".into(),
+            category: "skills".into(),
+            label: "Read".into(),
+            detail: String::new(),
+            evidence: Evidence::Available,
+            source: String::new(),
+            detail_token: None,
+        });
+        reply.tree = vec![TreeNode {
+            id: "skills".into(),
+            agent_id: "agent".into(),
+            parent_id: None,
+            label: "Skills".into(),
+            fact_ids: vec!["skill".into()],
+            detail_token: None,
+            category: "skills".into(),
+        }];
+        let with_capability = render_extension_tree(
+            Some(&Inspection {
+                stale: false,
+                reply,
+            }),
+            Some(&config),
+            "%1",
+            "claude",
+            Some("agent"),
+            &ui,
+            60,
+            &ColorTheme::default(),
+        );
+        assert!(
+            with_capability
+                .iter()
+                .all(|(_, target)| target.node_id != "fact:used")
+        );
+    }
+
+    #[test]
     fn extension_tree_only_renders_the_selected_subagent_capabilities() {
         let inspection = Inspection {
             stale: false,
@@ -616,12 +827,14 @@ mod tests {
                         id: "root".into(),
                         parent_id: None,
                         label: "root".into(),
+                        role: Default::default(),
                         model: None,
                     },
                     AgentNode {
                         id: "child".into(),
                         parent_id: Some("root".into()),
                         label: "child".into(),
+                        role: Default::default(),
                         model: None,
                     },
                 ],
@@ -716,6 +929,7 @@ mod tests {
                     id: "agent".into(),
                     parent_id: None,
                     label: "agent".into(),
+                    role: Default::default(),
                     model: None,
                 }],
                 builtins: vec![BuiltinSummary {

@@ -151,7 +151,7 @@ pub struct Detail {
 pub struct Reply {
     pub version: u32,
     pub facts: Vec<Fact>,
-    pub builtins: BuiltinSummary,
+    pub builtins: Vec<BuiltinSummary>,
     pub slots: BTreeMap<String, String>,
     pub error: Option<String>,
     pub agents: Vec<AgentNode>,
@@ -467,7 +467,12 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
     let valid = |value: &str| !value.is_empty() && value.len() <= MAX_TEXT && is_safe_text(value);
     let mut ids = std::collections::HashSet::new();
     let mut fact_ids = std::collections::HashSet::new();
-    for fact in reply.facts.iter().chain(&reply.builtins.exceptions) {
+    for fact in reply.facts.iter().chain(
+        reply
+            .builtins
+            .iter()
+            .flat_map(|summary| &summary.exceptions),
+    ) {
         if !valid(&fact.id)
             || !valid(&fact.agent_id)
             || !valid(&fact.category)
@@ -514,19 +519,24 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
     }
     let agent_ids: std::collections::HashSet<&str> =
         reply.agents.iter().map(|node| node.id.as_str()).collect();
-    for fact in reply.facts.iter().chain(&reply.builtins.exceptions) {
+    for fact in reply.facts.iter().chain(
+        reply
+            .builtins
+            .iter()
+            .flat_map(|summary| &summary.exceptions),
+    ) {
         if !agent_ids.contains(fact.agent_id.as_str()) {
             return Err("invalid fact agent id".into());
         }
     }
-    let builtins_present = reply.builtins.tools_count > 0
-        || reply.builtins.skills_count > 0
-        || !reply.builtins.exceptions.is_empty();
-    if (builtins_present && !valid(&reply.builtins.agent_id))
-        || (!reply.builtins.agent_id.is_empty()
-            && !agent_ids.contains(reply.builtins.agent_id.as_str()))
-    {
-        return Err("invalid built-ins agent id".into());
+    let mut builtin_agents = std::collections::HashSet::new();
+    for summary in &reply.builtins {
+        if !valid(&summary.agent_id)
+            || !agent_ids.contains(summary.agent_id.as_str())
+            || !builtin_agents.insert(summary.agent_id.as_str())
+        {
+            return Err("invalid or duplicate built-ins agent id".into());
+        }
     }
     for node in &reply.agents {
         if let Some(parent) = &node.parent_id
@@ -728,38 +738,68 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn dotfiles_collector_fixture_is_protocol_compatible() {
-        use std::os::unix::fs::PermissionsExt;
+    fn dotfiles_collector_output_is_protocol_compatible() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
 
         let dir = tempdir().unwrap();
-        let script = dir.path().join("collector");
+        let home = dir.path().join("home");
+        let project = home.join(".claude/projects/project");
+        let subagents = project.join("subagents");
+        let cwd = dir.path().join("workspace");
+        let runtime = dir.path().join("runtime");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&runtime).unwrap();
         std::fs::write(
-            &script,
-            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"version\":1,\"agents\":[{\"id\":\"root\",\"label\":\"main\",\"model\":\"claude-sonnet\"},{\"id\":\"sub-1\",\"parent_id\":\"root\",\"label\":\"research\",\"model\":\"gpt-5\"}],\"facts\":[{\"id\":\"skill-review\",\"agent_id\":\"sub-1\",\"category\":\"skills\",\"label\":\"review\",\"evidence\":\"observed\",\"source\":\"/tmp/project/SKILL.md\",\"detail_token\":\"skill-review\"}],\"builtins\":{\"agent_id\":\"sub-1\",\"tools_count\":6,\"skills_count\":3,\"exceptions\":[{\"id\":\"tool-error\",\"agent_id\":\"sub-1\",\"category\":\"tools\",\"label\":\"browser unavailable\",\"evidence\":\"error\"}]},\"tree\":[{\"id\":\"skills\",\"agent_id\":\"sub-1\",\"label\":\"Skills\",\"category\":\"skills\",\"fact_ids\":[\"skill-review\"]}]}'\n",
+            project.join("session-1.jsonl"),
+            r#"{"message":{"model":"claude-main"}}"#,
         )
         .unwrap();
-        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script, permissions).unwrap();
-        let config = ExtensionsConfig {
-            version: 1,
-            providers: BTreeMap::from([(
-                "claude".into(),
-                ProviderConfig {
-                    argv: vec![script.to_string_lossy().into_owned()],
-                    timeout_ms: 100,
-                    env: BTreeMap::new(),
-                },
-            )]),
-            ..ExtensionsConfig::default()
+        std::fs::write(
+            subagents.join("agent-worker.jsonl"),
+            r#"{"message":{"model":"claude-worker"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            subagents.join("agent-worker.meta.json"),
+            r#"{"description":"worker","parent_agent_id":"session-1"}"#,
+        )
+        .unwrap();
+        let request = Request {
+            version: PROTOCOL_VERSION,
+            op: "inspect",
+            provider: "claude",
+            pane_id: "%1",
+            cwd: Some(cwd.to_str().unwrap()),
+            session_id: Some("session-1"),
+            subagent_id: None,
         };
-
-        let reply =
-            inspect_once(&config, "claude", "%1", Some("/tmp/project"), Some("s1")).unwrap();
-        assert_eq!(reply.tree[0].agent_id, "sub-1");
-        assert_eq!(reply.builtins.tools_count, 6);
-        assert_eq!(reply.builtins.skills_count, 3);
-        assert_eq!(reply.builtins.exceptions.len(), 1);
+        let mut child = Command::new("/usr/bin/python3")
+            .arg("/home/toxyduck/dev/.dotenv/.config/tmux-agent-sidebar/collector.py")
+            .arg("claude")
+            .env_clear()
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        serde_json::to_writer(child.stdin.as_mut().unwrap(), &request).unwrap();
+        child.stdin.as_mut().unwrap().flush().unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let reply: Reply = serde_json::from_slice(&output.stdout).unwrap();
+        validate_reply(&reply).unwrap();
+        assert_eq!(reply.agents.len(), 2);
+        assert_eq!(reply.builtins.len(), 2);
+        assert!(
+            reply
+                .builtins
+                .iter()
+                .all(|summary| ["session-1", "worker"].contains(&summary.agent_id.as_str()))
+        );
     }
 
     #[cfg(unix)]

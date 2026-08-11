@@ -189,8 +189,13 @@ pub(super) fn render_extension_tree(
             lines.push(fact_line(fact, 0));
         }
     }
-    let builtins = &inspection.reply.builtins;
-    if builtins.agent_id == selected_agent_id && !is_hidden(config, "builtins") {
+    if let Some(builtins) = inspection
+        .reply
+        .builtins
+        .iter()
+        .find(|summary| summary.agent_id == selected_agent_id)
+        && !is_hidden(config, "builtins")
+    {
         let builtins_id = "__builtins__";
         let expanded = ui.is_expanded(pane_id, builtins_id);
         let exceptions: Vec<_> = builtins
@@ -477,7 +482,7 @@ mod tests {
                     label: "agent".into(),
                     model: None,
                 }],
-                builtins: crate::extension::BuiltinSummary {
+                builtins: vec![crate::extension::BuiltinSummary {
                     agent_id: "agent-1".into(),
                     tools_count: 6,
                     skills_count: 3,
@@ -491,7 +496,7 @@ mod tests {
                         source: String::new(),
                         detail_token: None,
                     }],
-                },
+                }],
                 tree: vec![TreeNode {
                     id: "skills".into(),
                     agent_id: "agent-1".into(),

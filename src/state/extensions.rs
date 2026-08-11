@@ -315,7 +315,80 @@ pub struct ExtensionsState {
     pub ui: CapabilityUiState,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TestActivationRequest {
+    pub target: crate::state::SubagentTarget,
+    pub cwd: Option<String>,
+    pub pane_pid: Option<u32>,
+    pub current_command: Option<String>,
+}
+
+#[cfg(test)]
+pub(crate) struct TestControlQueue(Receiver<WorkerRequest>);
+
+#[cfg(test)]
+impl TestControlQueue {
+    pub(crate) fn take_activation(&self) -> Option<TestActivationRequest> {
+        match self.0.try_recv().ok()? {
+            WorkerRequest::Activate {
+                target,
+                cwd,
+                pane_pid,
+                current_command,
+                ..
+            } => Some(TestActivationRequest {
+                target,
+                cwd,
+                pane_pid,
+                current_command,
+            }),
+            _ => None,
+        }
+    }
+}
+
 impl ExtensionsState {
+    #[cfg(test)]
+    pub(crate) fn with_test_control_queue(config: ExtensionsConfig) -> (Self, TestControlQueue) {
+        let (inspect_tx, _inspect_rx) = mpsc::sync_channel(1);
+        let (control_tx, control_rx) = mpsc::sync_channel(8);
+        let (_result_tx, rx) = mpsc::channel();
+        (
+            Self {
+                config: Some(config),
+                config_error: None,
+                config_path: PathBuf::new(),
+                config_mtime: None,
+                cache: HashMap::new(),
+                in_flight: HashSet::new(),
+                inspect_tx,
+                control_tx,
+                rx,
+                last_refresh: Instant::now(),
+                ui: CapabilityUiState::default(),
+            },
+            TestControlQueue(control_rx),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_test_inspection(
+        &mut self,
+        pane_id: &str,
+        provider: &str,
+        session_id: Option<&str>,
+        reply: Reply,
+    ) {
+        self.cache.insert(
+            CacheKey::new(provider, pane_id, session_id),
+            Inspection {
+                reply,
+                stale: false,
+            },
+        );
+    }
+
     pub fn load() -> Self {
         let config_path = crate::tmux::get_option(crate::tmux::SIDEBAR_EXTENSIONS_CONFIG)
             .map(PathBuf::from)

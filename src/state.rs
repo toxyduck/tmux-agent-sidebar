@@ -20,6 +20,8 @@ mod tab;
 mod timers;
 
 pub use activity::ActivityState;
+#[cfg(test)]
+pub(crate) use extensions::TestControlQueue;
 pub use extensions::{CapabilityUiState, DetailView, ExtensionsState, InlineDetail, TreeTarget};
 pub use filter::{RepoFilter, StatusFilter};
 pub use focus::{Focus, FocusState};

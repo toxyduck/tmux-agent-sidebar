@@ -265,10 +265,13 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extension::{AgentNode, AgentRole};
+    use crate::extension::{
+        AgentNode, AgentRole, Evidence, ExtensionsConfig, Fact, ProviderConfig, Reply, TreeNode,
+    };
     use crate::group::{PaneGitInfo, RepoGroup};
     use crate::state::{AppState, StatusFilter};
     use crate::tmux::{AgentType, PaneInfo, PaneStatus, PermissionMode, WorktreeMetadata};
+    use std::collections::BTreeMap;
 
     fn make_pane(id: &str, status: PaneStatus) -> PaneInfo {
         PaneInfo {
@@ -362,6 +365,94 @@ mod tests {
         assert!(!visible_text.iter().any(|line| line.contains("feature")));
         assert_ne!(hidden_text, visible_text);
         assert_eq!(hidden.lines.len(), visible.lines.len());
+    }
+
+    #[test]
+    fn focus_round_trip_preserves_tree_text_targets_and_disclosure() {
+        let mut pane = make_pane("%1", PaneStatus::Running);
+        pane.session_id = Some("session".into());
+        let mut state = AppState::new("%sidebar".into());
+        state.repo_groups = vec![RepoGroup {
+            name: "repo".into(),
+            has_focus: true,
+            panes: vec![(pane, PaneGitInfo::default())],
+        }];
+        state.extensions.config = Some(ExtensionsConfig {
+            providers: BTreeMap::from([(
+                "claude".into(),
+                ProviderConfig {
+                    argv: vec!["/bin/true".into()],
+                    timeout_ms: 100,
+                    env: BTreeMap::new(),
+                },
+            )]),
+            ..ExtensionsConfig::default()
+        });
+        state.extensions.seed_test_inspection(
+            "%1",
+            "claude",
+            Some("session"),
+            Reply {
+                version: 1,
+                agents: vec![AgentNode {
+                    id: "main".into(),
+                    parent_id: None,
+                    label: "Main agent".into(),
+                    role: AgentRole::Main,
+                    model: None,
+                }],
+                tree: vec![TreeNode {
+                    id: "skills".into(),
+                    agent_id: "main".into(),
+                    parent_id: None,
+                    label: "Skills".into(),
+                    fact_ids: vec!["skill-a".into()],
+                    detail_token: None,
+                    category: "skills".into(),
+                }],
+                facts: vec![Fact {
+                    id: "skill-a".into(),
+                    agent_id: "main".into(),
+                    category: "skills".into(),
+                    label: "Project skill".into(),
+                    detail: String::new(),
+                    evidence: Evidence::Available,
+                    source: String::new(),
+                    detail_token: None,
+                }],
+                ..Reply::default()
+            },
+        );
+        let disclosure = TreeTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            session_id: Some("session".into()),
+            agent_id: "main".into(),
+            node_id: "skills".into(),
+            detail_token: None,
+            inline_detail: None,
+            is_disclosure: true,
+        };
+        state.extensions.ui.toggle(&disclosure);
+        state.focus_state.sidebar_focused = true;
+
+        let focused = collect(&state, 28);
+        state.focus_state.sidebar_focused = false;
+        let unfocused = collect(&state, 28);
+        state.focus_state.sidebar_focused = true;
+        let refocused = collect(&state, 28);
+
+        let line_text = |rows: &CollectedRows| {
+            rows.lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(line_text(&focused), line_text(&unfocused));
+        assert_eq!(line_text(&focused), line_text(&refocused));
+        assert_eq!(focused.pending_tree, unfocused.pending_tree);
+        assert_eq!(focused.pending_tree, refocused.pending_tree);
+        assert!(state.extensions.ui.is_expanded(&disclosure));
     }
 
     #[test]

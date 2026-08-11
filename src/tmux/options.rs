@@ -280,6 +280,10 @@ pub mod test_mock {
             })
         })
     }
+
+    pub(crate) fn intercept_select_pane() -> bool {
+        MOCK.with(|m| m.borrow().is_some())
+    }
 }
 
 #[cfg(test)]

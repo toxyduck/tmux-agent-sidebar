@@ -95,6 +95,10 @@ pub fn kill_window(window_id: &str) -> Result<(), String> {
 }
 
 pub fn select_pane(pane_id: &str) {
+    #[cfg(test)]
+    if crate::tmux::test_mock::intercept_select_pane() {
+        return;
+    }
     // Find the session containing this pane and switch to it first
     let session_id = display_message(pane_id, "#{session_id}");
     if !session_id.is_empty() {

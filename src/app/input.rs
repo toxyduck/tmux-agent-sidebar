@@ -265,8 +265,12 @@ fn repo_popup_nav_up(state: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    use crate::extension::{AgentNode, AgentRole, ExtensionsConfig, ProviderConfig, Reply};
     use crate::group::RepoGroup;
     use crate::state::{NavigationTarget, RowTarget, SubagentTarget, TreeTarget};
+    use crate::tmux::{AgentType, PaneInfo, PaneStatus, PermissionMode, WorktreeMetadata};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -294,6 +298,162 @@ mod tests {
         state.global.selected_pane_row = 0;
         state.focus_state.focus = Focus::Panes;
         state
+    }
+
+    fn activation_ready_state() -> (
+        AppState,
+        crate::state::TestControlQueue,
+        SubagentTarget,
+        TreeTarget,
+    ) {
+        let cwd = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let pane = PaneInfo {
+            pane_id: "%1".into(),
+            pane_active: true,
+            status: PaneStatus::Running,
+            attention: false,
+            agent: AgentType::Claude,
+            path: cwd,
+            current_command: "claude".into(),
+            prompt: String::new(),
+            prompt_is_response: false,
+            started_at: None,
+            wait_reason: String::new(),
+            permission_mode: PermissionMode::Default,
+            subagents: Vec::new(),
+            pane_pid: Some(42),
+            worktree: WorktreeMetadata::default(),
+            session_id: Some("session".into()),
+            session_name: String::new(),
+            sidebar_spawned: false,
+            bg_shell_cmd: None,
+        };
+        let mut state = AppState::new("%sidebar".into());
+        state.repo_groups = vec![RepoGroup {
+            name: "project".into(),
+            has_focus: true,
+            panes: vec![(pane, Default::default())],
+        }];
+        let (extensions, queue) =
+            crate::state::ExtensionsState::with_test_control_queue(ExtensionsConfig {
+                providers: BTreeMap::from([(
+                    "claude".into(),
+                    ProviderConfig {
+                        argv: vec!["/bin/true".into()],
+                        timeout_ms: 100,
+                        env: BTreeMap::new(),
+                    },
+                )]),
+                ..ExtensionsConfig::default()
+            });
+        state.extensions = extensions;
+        state.extensions.seed_test_inspection(
+            "%1",
+            "claude",
+            Some("session"),
+            Reply {
+                version: 1,
+                agents: vec![
+                    AgentNode {
+                        id: "main".into(),
+                        parent_id: None,
+                        label: "Main".into(),
+                        role: AgentRole::Main,
+                        model: None,
+                    },
+                    AgentNode {
+                        id: "child".into(),
+                        parent_id: Some("main".into()),
+                        label: "Child".into(),
+                        role: AgentRole::Subagent,
+                        model: None,
+                    },
+                ],
+                ..Reply::default()
+            },
+        );
+        let subagent = SubagentTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            session_id: Some("session".into()),
+            agent_id: "child".into(),
+            node_id: "child".into(),
+        };
+        let capability = TreeTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            session_id: Some("session".into()),
+            agent_id: "child".into(),
+            node_id: "skills".into(),
+            detail_token: Some("skill-detail".into()),
+            inline_detail: None,
+            is_disclosure: false,
+        };
+        (state, queue, subagent, capability)
+    }
+
+    #[test]
+    fn mouse_and_enter_emit_one_identical_subagent_activation() {
+        let _guard = crate::tmux::test_mock::install();
+        let (mut mouse_state, mouse_queue, subagent, _) = activation_ready_state();
+        mouse_state
+            .layout
+            .subagent_line_targets
+            .insert(0, subagent.clone());
+        mouse_state.handle_mouse_click(2, 0);
+        let mouse_request = mouse_queue.take_activation().expect("mouse activation");
+        assert!(mouse_queue.take_activation().is_none());
+
+        let (mut key_state, key_queue, _, _) = activation_ready_state();
+        key_state.selected_navigation_target = Some(NavigationTarget::Subagent(subagent));
+        let flag = AtomicBool::new(false);
+        handle_key_event(key(KeyCode::Enter), &mut key_state, &flag);
+        let key_request = key_queue.take_activation().expect("Enter activation");
+        assert!(key_queue.take_activation().is_none());
+
+        assert_eq!(mouse_request, key_request);
+        let expected_cwd = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(mouse_request.cwd.as_deref(), Some(expected_cwd.as_str()));
+        assert_eq!(mouse_request.pane_pid, Some(42));
+        assert_eq!(mouse_request.current_command.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn tree_clicks_and_cursor_navigation_never_activate_subagents() {
+        let _guard = crate::tmux::test_mock::install();
+        let (mut state, queue, subagent, capability) = activation_ready_state();
+        let disclosure = TreeTarget {
+            is_disclosure: true,
+            detail_token: None,
+            ..capability.clone()
+        };
+        state.layout.tree_line_targets.insert(0, disclosure.clone());
+        state.layout.tree_line_targets.insert(1, capability.clone());
+        state.handle_mouse_click(2, 0);
+        state.handle_mouse_click(3, 0);
+        assert!(state.extensions.ui.is_expanded(&disclosure));
+        assert_eq!(state.extensions.ui.selected, Some(capability.clone()));
+        assert!(queue.take_activation().is_none());
+
+        state.layout.navigation_targets = vec![
+            NavigationTarget::Pane { row: 0 },
+            NavigationTarget::Subagent(subagent),
+            NavigationTarget::Tree(capability),
+        ];
+        state.selected_navigation_target = Some(NavigationTarget::Pane { row: 0 });
+        let flag = AtomicBool::new(false);
+        handle_key_event(key(KeyCode::Char('j')), &mut state, &flag);
+        handle_key_event(key(KeyCode::Down), &mut state, &flag);
+
+        assert!(queue.take_activation().is_none());
     }
 
     fn state_with_repo_popup_open() -> AppState {

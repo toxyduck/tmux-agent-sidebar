@@ -353,8 +353,7 @@ fn pane_output_needs_process_snapshot(all_panes_output: &str) -> bool {
             return false;
         }
         let pane_fields = &parts[session_line_field::PANE_LINE_OFFSET..];
-        AgentType::from_label(&pane_fields[pane_line_field::AGENT])
-            .is_some_and(|agent| matches!(agent, AgentType::Codex | AgentType::OpenCode))
+        AgentType::from_label(&pane_fields[pane_line_field::AGENT]).is_some()
     })
 }
 
@@ -709,6 +708,14 @@ mod tests {
         ProcessSnapshot::from_ps_output(ps_out)
     }
 
+    fn session_pane_line(fields: &[&str]) -> String {
+        ["main", "@1", "0", "project", "1", "0"]
+            .into_iter()
+            .chain(fields.iter().copied())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
     fn field_strings(fields: &[&str]) -> Vec<String> {
         fields.iter().map(|field| (*field).to_string()).collect()
     }
@@ -729,6 +736,22 @@ mod tests {
         assert_eq!(pane.pane_pid, Some(12345));
         assert_eq!(pane.subagents, vec!["Explore", "Plan"]);
         assert_eq!(pane.permission_mode, PermissionMode::Auto);
+    }
+
+    #[test]
+    fn process_snapshot_is_requested_for_claude_only_panes() {
+        let line = session_pane_line(&full_fields());
+
+        assert!(pane_output_needs_process_snapshot(&line));
+    }
+
+    #[test]
+    fn process_snapshot_is_not_requested_without_a_tagged_agent() {
+        let mut fields = full_fields();
+        fields[pane_line_field::AGENT] = "";
+        let line = session_pane_line(&fields);
+
+        assert!(!pane_output_needs_process_snapshot(&line));
     }
 
     #[test]

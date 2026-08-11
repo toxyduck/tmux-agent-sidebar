@@ -814,12 +814,14 @@ fn snapshot_worktree_long_branch_truncated_ui() {
         panes: vec![(pane, git_info)],
     }]);
 
-    let output = render_to_string(&mut state, 28, 25);
+    let output = render_to_string(&mut state, 28, 27);
     insta::assert_snapshot!(output, @r"
      ≡1  ●0  ◎0  ◐0  ○1  ✕0
     ⓘ                        — ▾
     project                    +
     ┃ ○ claude
+    ┃   + feature/very-long-bra…
+        Waiting for prompt…
     ╭ Activity │ Git ──────────╮
     │      No activity yet     │
     ╰──────────────────────────╯
@@ -843,11 +845,13 @@ fn snapshot_long_branch_with_ports_ui() {
     state.show_ports = true;
     state.set_pane_ports("%1", vec![3000, 5173]);
 
-    let output = render_to_string(&mut state, 40, 24);
+    let output = render_to_string(&mut state, 40, 27);
     insta::assert_snapshot!(output, @r"
      ≡1  ●1  ◎0  ◐0  ○0  ✕0
     ⓘ                                    — ▾
+    project                                +
     ┃ ● claude
+    ┃   feature/sidebar/really…  :3000, 5173
     ╭ Activity │ Git ──────────────────────╮
     │            No activity yet           │
     ╰──────────────────────────────────────╯
@@ -872,12 +876,14 @@ fn snapshot_task_progress_partial_ui() {
         }),
     );
 
-    let output = render_to_string(&mut state, 28, 25);
+    let output = render_to_string(&mut state, 28, 29);
     insta::assert_snapshot!(output, @r"
      ≡1  ●1  ◎0  ◐0  ○0  ✕0
     ⓘ                        — ▾
     project
     ┃ ● claude
+        ✔◼◻ 1/3
+        working
     ╭ Activity │ Git ──────────╮
     │      No activity yet     │
     ╰──────────────────────────╯

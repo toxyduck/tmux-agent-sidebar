@@ -5,7 +5,7 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// How long a PR lookup stays fresh before `PrCache` refetches it. PR numbers
 /// change only on branch switches (already keyed) or when a new PR is created
@@ -253,24 +253,13 @@ fn arc_patch_bytes_with_program(root: &str, program: &str) -> Result<Vec<u8>, St
         .stdout;
     let cached_sections = patch_sections(&cached);
     let worktree_sections = patch_sections(&worktree);
-    let cached_paths = cached_sections
-        .iter()
-        .filter_map(|section| section.path.clone())
-        .collect::<BTreeSet<_>>();
-    let worktree_paths = worktree_sections
-        .iter()
-        .filter_map(|section| section.path.clone())
-        .collect::<BTreeSet<_>>();
-    let overlap = cached_paths
-        .intersection(&worktree_paths)
-        .cloned()
-        .collect::<Vec<_>>();
+    let overlap = overlapping_snapshots(&cached_sections, &worktree_sections);
     let mut patch = Vec::new();
     for section in cached_sections.into_iter().chain(worktree_sections) {
         if section
             .path
             .as_ref()
-            .is_none_or(|path| !overlap.contains(path))
+            .is_none_or(|path| !overlap.iter().any(|snapshot| snapshot.matches(path)))
         {
             patch.extend(section.bytes);
         }
@@ -286,8 +275,46 @@ fn arc_patch_bytes_with_program(root: &str, program: &str) -> Result<Vec<u8>, St
 
 #[derive(Debug)]
 struct PatchSection {
-    path: Option<String>,
+    path: Option<PatchPaths>,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchPaths {
+    old: Option<Vec<u8>>,
+    new: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotPath {
+    before: Option<Vec<u8>>,
+    after: Option<Vec<u8>>,
+}
+
+impl SnapshotPath {
+    fn matches(&self, paths: &PatchPaths) -> bool {
+        [paths.old.as_ref(), paths.new.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|path| self.before.as_ref() == Some(path) || self.after.as_ref() == Some(path))
+    }
+}
+
+fn overlapping_snapshots(cached: &[PatchSection], worktree: &[PatchSection]) -> Vec<SnapshotPath> {
+    let mut snapshots = Vec::new();
+    for index in cached.iter().filter_map(|section| section.path.as_ref()) {
+        for final_change in worktree.iter().filter_map(|section| section.path.as_ref()) {
+            let index_final = index.new.as_ref().or(index.old.as_ref());
+            let worktree_identity = final_change.old.as_ref().or(final_change.new.as_ref());
+            if index_final.is_some() && index_final == worktree_identity {
+                snapshots.push(SnapshotPath {
+                    before: index.old.clone(),
+                    after: final_change.new.clone().or(final_change.old.clone()),
+                });
+            }
+        }
+    }
+    snapshots
 }
 
 fn patch_sections(patch: &[u8]) -> Vec<PatchSection> {
@@ -318,18 +345,44 @@ fn patch_sections(patch: &[u8]) -> Vec<PatchSection> {
             let end = starts.get(index + 1).copied().unwrap_or(patch.len());
             let bytes = patch[*start..end].to_vec();
             PatchSection {
-                path: patch_section_path(&bytes),
+                path: patch_section_paths(&bytes),
                 bytes,
             }
         })
         .collect()
 }
 
-fn patch_section_path(section: &[u8]) -> Option<String> {
+fn patch_section_paths(section: &[u8]) -> Option<PatchPaths> {
     let line = section.split(|byte| *byte == b'\n').next()?;
     let value = line.strip_prefix(b"diff --git ")?;
-    let path = parse_git_path_token(value)?;
-    String::from_utf8(path.strip_prefix(b"a/")?.to_vec()).ok()
+    let old = parse_git_path_token(value)?;
+    let remainder = &value[git_path_token_len(value)?..];
+    let new = parse_git_path_token(remainder.strip_prefix(b" ")?)?;
+    let mut paths = PatchPaths {
+        old: (old != b"/dev/null").then(|| old.strip_prefix(b"a/").unwrap_or(&old).to_vec()),
+        new: (new != b"/dev/null").then(|| new.strip_prefix(b"b/").unwrap_or(&new).to_vec()),
+    };
+    if section.windows(15).any(|line| line == b"\n--- /dev/null\n") {
+        paths.old = None;
+    }
+    if section.windows(15).any(|line| line == b"\n+++ /dev/null\n") {
+        paths.new = None;
+    }
+    Some(paths)
+}
+
+fn git_path_token_len(value: &[u8]) -> Option<usize> {
+    if value.first() != Some(&b'"') {
+        return Some(value.iter().position(|byte| *byte == b' ')?);
+    }
+    let mut escaped = false;
+    for (index, byte) in value.iter().enumerate().skip(1) {
+        if !escaped && *byte == b'"' {
+            return Some(index + 1);
+        }
+        escaped = !escaped && *byte == b'\\';
+    }
+    None
 }
 
 fn parse_git_path_token(value: &[u8]) -> Option<Vec<u8>> {
@@ -368,47 +421,32 @@ fn parse_git_path_token(value: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-struct TempSnapshot {
-    path: PathBuf,
-}
-impl TempSnapshot {
-    fn new(label: &str) -> Result<Self, String> {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "tmux-agent-sidebar-{label}-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&path).map_err(|error| error.to_string())?;
-        Ok(Self { path })
-    }
-}
-impl Drop for TempSnapshot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-fn arc_snapshot_patch(root: &str, program: &str, paths: &[String]) -> Result<Vec<u8>, String> {
-    for path in paths {
-        safe_arc_relative_path(root, path)?;
-    }
-    let before = TempSnapshot::new("arc-before")?;
-    let after = TempSnapshot::new("arc-after")?;
+fn arc_snapshot_patch(
+    root: &str,
+    program: &str,
+    paths: &[SnapshotPath],
+) -> Result<Vec<u8>, String> {
+    let before = secure_tempdir("tmux-agent-sidebar-arc-before-")?;
+    let after = secure_tempdir("tmux-agent-sidebar-arc-after-")?;
     let mut args = vec!["export".to_owned(), "HEAD".to_owned()];
-    args.extend(paths.iter().cloned());
-    args.extend(["--to".to_owned(), before.path.display().to_string()]);
+    for path in paths.iter().filter_map(|path| path.before.as_deref()) {
+        let path = String::from_utf8(path.to_vec())
+            .map_err(|_| "Arc paths must be UTF-8 for export".to_string())?;
+        safe_arc_relative_path(root, &path)?;
+        args.push(path);
+    }
+    args.extend(["--to".to_owned(), before.path().display().to_string()]);
     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
     command_output(root, program, &refs, false)
         .map_err(|error| format!("cannot export Arc HEAD snapshot: {error}"))?;
-    for path in paths {
-        let source = safe_arc_relative_path(root, path)?;
+    for path in paths.iter().filter_map(|path| path.after.as_deref()) {
+        let path = String::from_utf8(path.to_vec())
+            .map_err(|_| "Arc paths must be UTF-8 for snapshot".to_string())?;
+        let source = safe_arc_relative_path(root, &path)?;
         if !source.exists() && fs::symlink_metadata(&source).is_err() {
             continue;
         }
-        let destination = after.path.join(path);
+        let destination = after.path().join(path);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
@@ -422,17 +460,34 @@ fn arc_snapshot_patch(root: &str, program: &str, paths: &[String]) -> Result<Vec
             "--no-color",
             "--binary",
             "--",
-            before.path.to_str().ok_or("non-UTF8 temp path")?,
-            after.path.to_str().ok_or("non-UTF8 temp path")?,
+            before.path().to_str().ok_or("non-UTF8 temp path")?,
+            after.path().to_str().ok_or("non-UTF8 temp path")?,
         ],
         true,
     )
     .map_err(|error| format!("cannot format Arc snapshot patch with git: {error}"))?;
     Ok(normalize_snapshot_prefixes(
         output.stdout,
-        &before.path,
-        &after.path,
+        before.path(),
+        after.path(),
     ))
+}
+
+fn secure_tempdir(prefix: &str) -> Result<tempfile::TempDir, String> {
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(dir.path())
+            .map_err(|error| error.to_string())?
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(dir.path(), permissions).map_err(|error| error.to_string())?;
+    }
+    Ok(dir)
 }
 
 fn copy_snapshot_file(source: &Path, destination: &Path) -> Result<(), String> {
@@ -454,26 +509,50 @@ fn copy_snapshot_file(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn normalize_snapshot_prefixes(mut patch: Vec<u8>, before: &Path, after: &Path) -> Vec<u8> {
-    for (prefix, from) in [(b'a', before), (b'b', after)] {
+fn normalize_snapshot_prefixes(patch: Vec<u8>, before: &Path, after: &Path) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(patch.len());
+    for line in patch.split_inclusive(|byte| *byte == b'\n') {
+        if [
+            b"diff --git ".as_slice(),
+            b"--- ",
+            b"+++ ",
+            b"rename from ",
+            b"rename to ",
+            b"copy from ",
+            b"copy to ",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+        {
+            normalized.extend(normalize_snapshot_header(line, before, after));
+        } else {
+            normalized.extend_from_slice(line);
+        }
+    }
+    normalized
+}
+
+fn normalize_snapshot_header(line: &[u8], before: &Path, after: &Path) -> Vec<u8> {
+    let mut line = line.to_vec();
+    for (prefix, path) in [(b'a', before), (b'b', after)] {
         let mut needle = vec![prefix];
-        needle.extend_from_slice(from.as_os_str().as_encoded_bytes());
+        needle.extend_from_slice(path.as_os_str().as_encoded_bytes());
         needle.push(b'/');
         let replacement = [prefix, b'/'];
-        let mut replaced = Vec::with_capacity(patch.len());
-        let mut rest = patch.as_slice();
+        let mut normalized = Vec::with_capacity(line.len());
+        let mut rest = line.as_slice();
         while let Some(index) = rest
             .windows(needle.len())
             .position(|window| window == needle)
         {
-            replaced.extend_from_slice(&rest[..index]);
-            replaced.extend_from_slice(&replacement);
+            normalized.extend_from_slice(&rest[..index]);
+            normalized.extend_from_slice(&replacement);
             rest = &rest[index + needle.len()..];
         }
-        replaced.extend_from_slice(rest);
-        patch = replaced;
+        normalized.extend_from_slice(rest);
+        line = normalized;
     }
-    patch
+    line
 }
 
 fn git_untracked_paths(root: &str) -> Result<Vec<String>, String> {
@@ -1561,7 +1640,13 @@ mod tests {
         let sections = patch_sections(
             b"diff --git \"a/space \\\"quote\\\"\" \"b/space \\\"quote\\\"\"\n--- \"a/space \\\"quote\\\"\"\n",
         );
-        assert_eq!(sections[0].path.as_deref(), Some("space \"quote\""));
+        assert_eq!(
+            sections[0]
+                .path
+                .as_ref()
+                .and_then(|paths| paths.new.as_deref()),
+            Some(b"space \"quote\"".as_slice())
+        );
     }
 
     #[test]
@@ -1574,6 +1659,66 @@ mod tests {
             after,
         );
         assert_eq!(patch, b"diff --git a/file b/file\n--- a/file\n+++ b/file\n");
+    }
+
+    #[test]
+    fn arc_normalizes_only_path_headers_not_hunks_or_binary_payload() {
+        let patch = normalize_snapshot_prefixes(
+            b"diff --git a/tmp/before/file b/tmp/after/file\n--- a/tmp/before/file\n+++ b/tmp/after/file\n+sentinel /tmp/before/file\nGIT binary patch\nliteral 3\n/tmp/after/file\n".to_vec(),
+            Path::new("/tmp/before"),
+            Path::new("/tmp/after"),
+        );
+        assert!(patch.starts_with(b"diff --git a/file b/file\n--- a/file\n+++ b/file\n"));
+        assert!(patch.ends_with(
+            b"+sentinel /tmp/before/file\nGIT binary patch\nliteral 3\n/tmp/after/file\n"
+        ));
+    }
+
+    #[test]
+    fn arc_patch_sections_keep_non_utf8_paths_as_bytes() {
+        let sections = patch_sections(b"diff --git \"a/non\\377utf8\" \"b/non\\377utf8\"\n");
+        assert_eq!(
+            sections[0]
+                .path
+                .as_ref()
+                .and_then(|paths| paths.new.as_deref()),
+            Some(b"non\xffutf8".as_slice())
+        );
+    }
+
+    #[test]
+    fn arc_overlap_new_file_does_not_have_head_snapshot_path() {
+        let cached = patch_sections(
+            b"diff --git a/new b/new\nnew file mode 100644\n--- /dev/null\n+++ b/new\n",
+        );
+        let worktree = patch_sections(b"diff --git a/new b/new\n--- a/new\n+++ b/new\n");
+        let snapshots = overlapping_snapshots(&cached, &worktree);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].before, None);
+        assert_eq!(snapshots[0].after.as_deref(), Some(b"new".as_slice()));
+    }
+
+    #[test]
+    fn arc_overlap_rename_uses_old_head_and_new_final_path() {
+        let cached = patch_sections(
+            b"diff --git a/old b/new\nsimilarity index 100%\nrename from old\nrename to new\n",
+        );
+        let worktree = patch_sections(b"diff --git a/new b/new\n--- a/new\n+++ b/new\n");
+        let snapshots = overlapping_snapshots(&cached, &worktree);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].before.as_deref(), Some(b"old".as_slice()));
+        assert_eq!(snapshots[0].after.as_deref(), Some(b"new".as_slice()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn arc_temp_snapshot_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = secure_tempdir("tmux-agent-sidebar-arc-test-").unwrap();
+        assert_eq!(
+            fs::metadata(dir.path()).unwrap().permissions().mode() & 0o077,
+            0
+        );
     }
 
     #[cfg(unix)]

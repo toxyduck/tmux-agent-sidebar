@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -168,11 +170,33 @@ fn command_output(
     args: &[&str],
     allow_diff_exit: bool,
 ) -> Result<Output, String> {
-    let mut child = Command::new(program)
+    command_output_with_args(path, program, args, allow_diff_exit, Duration::from_secs(5))
+}
+
+fn command_output_with_args<S: AsRef<OsStr>>(
+    path: &str,
+    program: &str,
+    args: &[S],
+    allow_diff_exit: bool,
+    timeout: Duration,
+) -> Result<Output, String> {
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(path)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| format!("cannot launch {program}: {error}"))?;
     let mut stdout = child.stdout.take().expect("piped stdout");
@@ -185,7 +209,7 @@ fn command_output(
         let mut bytes = Vec::new();
         stderr.read_to_end(&mut bytes).map(|_| bytes)
     });
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + timeout;
     loop {
         if child
             .try_wait()
@@ -212,29 +236,24 @@ fn command_output(
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
         if Instant::now() >= deadline {
+            #[cfg(unix)]
+            let _ = unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            #[cfg(not(unix))]
             let _ = child.kill();
             let _ = child.wait();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Err(format!("{program} timed out"));
+            return Err(format!(
+                "{program} timed out after {}ms",
+                timeout.as_millis()
+            ));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
 
-/// Arc accepts Unix filenames as raw OS strings. This is deliberately kept
-/// beside the byte-path snapshot path rather than converting through UTF-8.
 fn command_output_os(path: &str, program: &str, args: &[OsString]) -> Result<Output, String> {
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(path)
-        .output()
-        .map_err(|error| format!("cannot launch {program}: {error}"))?;
-    if output.status.success() {
-        Ok(output)
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
+    command_output_with_args(path, program, args, false, Duration::from_secs(5))
 }
 
 fn run_command_text(path: &str, program: &str, args: &[&str]) -> Option<String> {
@@ -1785,6 +1804,29 @@ mod tests {
         .unwrap();
         assert!(patch.contains("diff --git a/new b/new"));
         assert!(!patch.contains("tmux-agent-sidebar-arc-"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn arc_raw_export_runner_times_out_and_reaps_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake-arc-hang");
+        fs::write(&fake, "#!/bin/sh\nsleep 5\n").unwrap();
+        let mut permissions = fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake, permissions).unwrap();
+        let started = Instant::now();
+        let error = command_output_with_args(
+            dir.path().to_str().unwrap(),
+            fake.to_str().unwrap(),
+            &[OsString::from_vec(b"non\xffutf8".to_vec())],
+            false,
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(error.contains("timed out after 50ms"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

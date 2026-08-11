@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -219,6 +222,21 @@ fn command_output(
     }
 }
 
+/// Arc accepts Unix filenames as raw OS strings. This is deliberately kept
+/// beside the byte-path snapshot path rather than converting through UTF-8.
+fn command_output_os(path: &str, program: &str, args: &[OsString]) -> Result<Output, String> {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(path)
+        .output()
+        .map_err(|error| format!("cannot launch {program}: {error}"))?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 fn run_command_text(path: &str, program: &str, args: &[&str]) -> Option<String> {
     let output = command_output(path, program, args, false).ok()?;
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -428,25 +446,34 @@ fn arc_snapshot_patch(
 ) -> Result<Vec<u8>, String> {
     let before = secure_tempdir("tmux-agent-sidebar-arc-before-")?;
     let after = secure_tempdir("tmux-agent-sidebar-arc-after-")?;
-    let mut args = vec!["export".to_owned(), "HEAD".to_owned()];
-    for path in paths.iter().filter_map(|path| path.before.as_deref()) {
-        let path = String::from_utf8(path.to_vec())
-            .map_err(|_| "Arc paths must be UTF-8 for export".to_string())?;
-        safe_arc_relative_path(root, &path)?;
-        args.push(path);
+    let before_paths = paths
+        .iter()
+        .filter_map(|path| path.before.as_deref())
+        .map(|path| safe_arc_relative_path_bytes(root, path))
+        .collect::<Result<Vec<_>, _>>()?;
+    if !before_paths.is_empty() {
+        let mut args = vec![OsString::from("export"), OsString::from("HEAD")];
+        args.extend(
+            paths
+                .iter()
+                .filter_map(|path| path.before.as_deref())
+                .map(os_string_from_bytes),
+        );
+        args.push(OsString::from("--to"));
+        args.push(before.path().as_os_str().to_os_string());
+        command_output_os(root, program, &args)
+            .map_err(|error| format!("cannot export Arc HEAD snapshot: {error}"))?;
     }
-    args.extend(["--to".to_owned(), before.path().display().to_string()]);
-    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    command_output(root, program, &refs, false)
-        .map_err(|error| format!("cannot export Arc HEAD snapshot: {error}"))?;
     for path in paths.iter().filter_map(|path| path.after.as_deref()) {
-        let path = String::from_utf8(path.to_vec())
-            .map_err(|_| "Arc paths must be UTF-8 for snapshot".to_string())?;
-        let source = safe_arc_relative_path(root, &path)?;
+        let source = safe_arc_relative_path_bytes(root, path)?;
         if !source.exists() && fs::symlink_metadata(&source).is_err() {
             continue;
         }
-        let destination = after.path().join(path);
+        let destination = after.path().join(
+            source
+                .strip_prefix(root)
+                .map_err(|error| error.to_string())?,
+        );
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
@@ -488,6 +515,41 @@ fn secure_tempdir(prefix: &str) -> Result<tempfile::TempDir, String> {
         fs::set_permissions(dir.path(), permissions).map_err(|error| error.to_string())?;
     }
     Ok(dir)
+}
+
+#[cfg(unix)]
+fn os_string_from_bytes(path: &[u8]) -> OsString {
+    OsString::from_vec(path.to_vec())
+}
+
+#[cfg(not(unix))]
+fn os_string_from_bytes(path: &[u8]) -> OsString {
+    OsString::from(String::from_utf8_lossy(path).into_owned())
+}
+
+fn safe_arc_relative_path_bytes(root: &str, path: &[u8]) -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    let path = PathBuf::from(os_string_from_bytes(path));
+    #[cfg(not(unix))]
+    let path = PathBuf::from(String::from_utf8_lossy(path).into_owned());
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(format!("unsafe Arc untracked path: {:?}", path));
+    }
+    let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let candidate = root.join(path);
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| "untracked path has no parent".to_string())?;
+    let parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
+    if !parent.starts_with(&root) {
+        return Err("Arc untracked path escapes mount".to_string());
+    }
+    Ok(candidate)
 }
 
 fn copy_snapshot_file(source: &Path, destination: &Path) -> Result<(), String> {
@@ -534,7 +596,7 @@ fn normalize_snapshot_prefixes(patch: Vec<u8>, before: &Path, after: &Path) -> V
 
 fn normalize_snapshot_header(line: &[u8], before: &Path, after: &Path) -> Vec<u8> {
     let mut line = line.to_vec();
-    for (prefix, path) in [(b'a', before), (b'b', after)] {
+    for (prefix, path) in [(b'a', before), (b'b', before), (b'a', after), (b'b', after)] {
         let mut needle = vec![prefix];
         needle.extend_from_slice(path.as_os_str().as_encoded_bytes());
         needle.push(b'/');
@@ -1696,6 +1758,43 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].before, None);
         assert_eq!(snapshots[0].after.as_deref(), Some(b"new".as_slice()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn arc_snapshot_new_file_skips_pathless_export_and_has_no_temp_headers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("new"), "final\n").unwrap();
+        let fake = dir.path().join("fake-arc-no-export");
+        fs::write(&fake, "#!/bin/sh\necho unexpected export >&2\nexit 9\n").unwrap();
+        let mut permissions = fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake, permissions).unwrap();
+        let patch = String::from_utf8(
+            arc_snapshot_patch(
+                dir.path().to_str().unwrap(),
+                fake.to_str().unwrap(),
+                &[SnapshotPath {
+                    before: None,
+                    after: Some(b"new".to_vec()),
+                }],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(patch.contains("diff --git a/new b/new"));
+        assert!(!patch.contains("tmux-agent-sidebar-arc-"));
+    }
+
+    #[test]
+    fn arc_normalizes_new_and_deleted_snapshot_headers() {
+        let patch = normalize_snapshot_prefixes(
+            b"diff --git a/tmp/after/new b/tmp/after/new\n--- /dev/null\n+++ b/tmp/after/new\ndiff --git a/tmp/before/old b/tmp/before/old\n--- a/tmp/before/old\n+++ /dev/null\n".to_vec(),
+            Path::new("/tmp/before"),
+            Path::new("/tmp/after"),
+        );
+        assert_eq!(patch, b"diff --git a/new b/new\n--- /dev/null\n+++ b/new\ndiff --git a/old b/old\n--- a/old\n+++ /dev/null\n");
     }
 
     #[test]

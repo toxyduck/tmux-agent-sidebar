@@ -176,82 +176,82 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                 state.now,
             );
             let mut pane_lines = pane_lines;
-            // Capability collectors return stable child identities. Show their
-            // tree only for the selected parent and bind clicks directly to
-            // those identities; legacy display labels remain non-interactive.
-            if cursor_selected {
-                if let Some(inspection) = state.extensions.inspection(
-                    &pane.pane_id,
-                    pane.agent.as_str(),
-                    pane.session_id.as_deref(),
-                ) {
-                    let root_id = inspection
-                        .reply
-                        .agents
-                        .iter()
-                        .find(|agent| agent.parent_id.is_none())
-                        .map(|agent| agent.id.clone())
-                        .unwrap_or_else(|| pane.pane_id.clone());
-                    let mut children: Vec<_> = inspection
-                        .reply
-                        .agents
-                        .iter()
-                        .filter(|agent| agent.parent_id.is_some())
-                        .collect();
-                    children.sort_by(|left, right| {
-                        let left_rank =
-                            matches!(left.lifecycle, crate::extension::AgentLifecycle::Running)
-                                as u8;
-                        let right_rank =
-                            matches!(right.lifecycle, crate::extension::AgentLifecycle::Running)
-                                as u8;
-                        right_rank
-                            .cmp(&left_rank)
-                            .then_with(|| left.label.cmp(&right.label))
-                            .then_with(|| left.id.cmp(&right.id))
-                    });
-                    for agent in children.iter().copied().filter(|agent| {
-                        matches!(agent.lifecycle, crate::extension::AgentLifecycle::Running)
-                    }) {
-                        pane_lines.push(agent_line("●", agent, theme.accent));
-                    }
-                    let inactive: Vec<_> = children
-                        .into_iter()
-                        .filter(|agent| {
-                            !matches!(agent.lifecycle, crate::extension::AgentLifecycle::Running)
-                        })
-                        .collect();
-                    if !inactive.is_empty() {
-                        let target = TreeTarget {
-                            parent_pane_id: pane.pane_id.clone(),
-                            provider_id: pane.agent.as_str().to_string(),
-                            session_id: pane.session_id.clone(),
-                            agent_id: root_id,
-                            node_id: INACTIVE_AGENTS_DISCLOSURE.to_string(),
-                            detail_token: None,
-                            inline_detail: None,
-                            is_disclosure: true,
-                        };
-                        let expanded = state.extensions.ui.is_expanded(&target);
-                        let disclosure = if expanded { "▼" } else { "▶" };
-                        let line = collected.lines.len() + pane_lines.len();
-                        pane_lines.push(Line::from(Span::styled(
-                            format!("  {disclosure} Inactive / unknown ({})", inactive.len()),
-                            Style::default().fg(theme.text_muted),
-                        )));
-                        collected.pending_tree.push((line, target));
-                        if expanded {
-                            for agent in inactive {
-                                let marker = match agent.lifecycle {
-                                    crate::extension::AgentLifecycle::Completed => "○",
-                                    crate::extension::AgentLifecycle::Unknown => "?",
-                                    crate::extension::AgentLifecycle::Running => unreachable!(),
-                                };
-                                pane_lines.push(agent_line(marker, agent, theme.text_muted));
-                            }
+            // Lifecycle is activity, not a selection detail: every rendered
+            // pane keeps its running children visible. Only the synthetic
+            // inactive disclosure receives a tree target; child rows never do.
+            if let Some(inspection) = state.extensions.inspection(
+                &pane.pane_id,
+                pane.agent.as_str(),
+                pane.session_id.as_deref(),
+            ) {
+                let root_id = inspection
+                    .reply
+                    .agents
+                    .iter()
+                    .find(|agent| agent.parent_id.is_none())
+                    .map(|agent| agent.id.clone())
+                    .unwrap_or_else(|| pane.pane_id.clone());
+                let mut children: Vec<_> = inspection
+                    .reply
+                    .agents
+                    .iter()
+                    .filter(|agent| agent.parent_id.is_some())
+                    .collect();
+                children.sort_by(|left, right| {
+                    let left_rank =
+                        matches!(left.lifecycle, crate::extension::AgentLifecycle::Running) as u8;
+                    let right_rank =
+                        matches!(right.lifecycle, crate::extension::AgentLifecycle::Running) as u8;
+                    right_rank
+                        .cmp(&left_rank)
+                        .then_with(|| left.label.cmp(&right.label))
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                for agent in children.iter().copied().filter(|agent| {
+                    matches!(agent.lifecycle, crate::extension::AgentLifecycle::Running)
+                }) {
+                    pane_lines.push(agent_line("●", agent, theme.accent));
+                }
+                let inactive: Vec<_> = children
+                    .into_iter()
+                    .filter(|agent| {
+                        !matches!(agent.lifecycle, crate::extension::AgentLifecycle::Running)
+                    })
+                    .collect();
+                if !inactive.is_empty() {
+                    let target = TreeTarget {
+                        parent_pane_id: pane.pane_id.clone(),
+                        provider_id: pane.agent.as_str().to_string(),
+                        session_id: pane.session_id.clone(),
+                        agent_id: root_id,
+                        node_id: INACTIVE_AGENTS_DISCLOSURE.to_string(),
+                        detail_token: None,
+                        inline_detail: None,
+                        is_disclosure: true,
+                    };
+                    let expanded = state.extensions.ui.is_expanded(&target);
+                    let disclosure = if expanded { "▼" } else { "▶" };
+                    let line = collected.lines.len() + pane_lines.len();
+                    pane_lines.push(Line::from(Span::styled(
+                        format!("  {disclosure} Inactive / unknown ({})", inactive.len()),
+                        Style::default().fg(theme.text_muted),
+                    )));
+                    collected.pending_tree.push((line, target));
+                    if expanded {
+                        for agent in inactive {
+                            let marker = match agent.lifecycle {
+                                crate::extension::AgentLifecycle::Completed => "○",
+                                crate::extension::AgentLifecycle::Unknown => "?",
+                                crate::extension::AgentLifecycle::Running => unreachable!(),
+                            };
+                            pane_lines.push(agent_line(marker, agent, theme.text_muted));
                         }
                     }
                 }
+            }
+            // Capabilities remain a root-only detail of the cursor-selected
+            // pane. Child facts deliberately do not become selectable rows.
+            if cursor_selected {
                 // Capabilities are intentionally rendered only for the selected
                 // parent AgentNode. Their click identity uses TreeNode.id, never
                 // a duplicate label or current line offset.

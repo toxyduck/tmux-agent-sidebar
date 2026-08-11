@@ -7,6 +7,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::extension::{self, Detail, ExtensionsConfig, Inspection, Reply, TranscriptDocument};
 
+const INACTIVE_AGENTS_DISCLOSURE: &str = "__inactive_agents__";
+
 /// A frame target is identified by collector data, never by a rendered label
 /// or a row number. Duplicate agent/capability labels are therefore harmless.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,7 +139,7 @@ impl CapabilityUiState {
     }
 
     fn reconcile_scope(&mut self, key: &CacheKey, reply: &Reply) {
-        let available: HashSet<(&str, &str)> = reply
+        let mut available: HashSet<(&str, &str)> = reply
             .tree
             .iter()
             .filter(|node| {
@@ -155,6 +157,13 @@ impl CapabilityUiState {
                     .map(|summary| (summary.agent_id.as_str(), "__builtins__")),
             )
             .collect();
+        if reply.agents.iter().any(|agent| {
+            agent.parent_id.is_some()
+                && !matches!(agent.lifecycle, crate::extension::AgentLifecycle::Running)
+        }) && let Some(root) = reply.agents.iter().find(|agent| agent.parent_id.is_none())
+        {
+            available.insert((root.id.as_str(), INACTIVE_AGENTS_DISCLOSURE));
+        }
         self.expanded.retain(|expanded| {
             expanded.provider_id != key.provider
                 || expanded.parent_pane_id != key.pane_id

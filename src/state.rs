@@ -20,7 +20,7 @@ mod tab;
 mod timers;
 
 pub use activity::ActivityState;
-pub use extensions::{CapabilityUiState, DetailView, ExtensionsState, TreeTarget};
+pub use extensions::{CapabilityUiState, DetailView, ExtensionsState, InlineDetail, TreeTarget};
 pub use filter::{RepoFilter, StatusFilter};
 pub use focus::{Focus, FocusState};
 pub use global::GlobalState;
@@ -164,6 +164,17 @@ impl AppState {
         let Some(target) = self.extensions.ui.selected.clone() else {
             return;
         };
+        if let Some(detail) = target.inline_detail.as_ref() {
+            self.extensions.ui.detail = Some(DetailView {
+                title: detail.title.clone(),
+                source: String::new(),
+                text: sanitize_detail_text(&detail.text),
+                scroll: 0,
+                previous_selection: Some(target),
+                previous_pane_scroll: self.scrolls.panes.offset,
+            });
+            return;
+        }
         let Some(_) = target.detail_token.as_deref() else {
             return;
         };
@@ -1402,6 +1413,25 @@ mod tests {
 
         state.handle_mouse_click(4, 5); // row 4 → line_index = (4-2) = 2 → agent row 1
         assert_eq!(state.global.selected_pane_row, 1);
+    }
+
+    #[test]
+    fn mouse_click_toggles_builtin_disclosure_by_stable_target() {
+        let mut state = AppState::new("%99".into());
+        let target = TreeTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            agent_id: "agent".into(),
+            node_id: "__builtins__".into(),
+            detail_token: None,
+            inline_detail: None,
+            is_disclosure: true,
+        };
+        state.layout.tree_line_targets.insert(0, target.clone());
+        state.handle_mouse_click(2, 5);
+
+        assert!(state.extensions.ui.is_expanded("%1", "__builtins__"));
+        assert_eq!(state.extensions.ui.selected, Some(target));
     }
 
     #[test]

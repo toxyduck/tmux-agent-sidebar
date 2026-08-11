@@ -82,6 +82,8 @@ impl AppState {
                         pane.agent.as_str().to_string(),
                         pane.session_id.clone(),
                         canonical_pane_cwd(&pane.path),
+                        pane.pane_pid,
+                        (!pane.current_command.is_empty()).then(|| pane.current_command.clone()),
                     )
                 })
             }));

@@ -59,6 +59,11 @@ pub struct Request<'a> {
     /// collector must not infer it from its own process working directory.
     pub cwd: Option<&'a str>,
     pub session_id: Option<&'a str>,
+    /// Exact tmux pane PID, when tmux reports one. It is not a process-tree
+    /// lookup and is optional because older tmux servers may omit it.
+    pub pane_pid: Option<u32>,
+    /// Exact tmux `pane_current_command`; never inferred from this process.
+    pub current_command: Option<&'a str>,
     pub subagent_id: Option<&'a str>,
 }
 
@@ -103,6 +108,30 @@ pub struct BuiltinSummary {
     pub skills_count: usize,
     #[serde(default)]
     pub exceptions: Vec<Fact>,
+    /// Individual built-ins for the selected agent. Older collectors omit
+    /// this field and retain the collapsed count-only presentation.
+    #[serde(default)]
+    pub items: Vec<BuiltinItem>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltinKind {
+    Tool,
+    Skill,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BuiltinItem {
+    pub id: String,
+    pub name: String,
+    pub kind: BuiltinKind,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub evidence: Evidence,
+    #[serde(default)]
+    pub exception: Option<String>,
 }
 
 /// Provider-neutral identity. `id` is stable within `(provider, session_id)`;
@@ -233,6 +262,8 @@ pub fn inspect(
         pane_id,
         cwd: None,
         session_id,
+        pane_pid: None,
+        current_command: None,
         subagent_id: None,
     };
     match call(program, &request) {
@@ -266,6 +297,8 @@ pub fn inspect_once(
     pane_id: &str,
     cwd: Option<&str>,
     session_id: Option<&str>,
+    pane_pid: Option<u32>,
+    current_command: Option<&str>,
 ) -> Result<Reply, String> {
     let program = config
         .providers
@@ -280,6 +313,8 @@ pub fn inspect_once(
             pane_id,
             cwd,
             session_id,
+            pane_pid,
+            current_command,
             subagent_id: None,
         },
     )
@@ -309,6 +344,8 @@ pub fn activate(
             pane_id,
             cwd,
             session_id,
+            pane_pid: None,
+            current_command: None,
             subagent_id: Some(subagent_id),
         },
     )
@@ -338,6 +375,8 @@ pub fn detail(
             pane_id,
             cwd,
             session_id,
+            pane_pid: None,
+            current_command: None,
             subagent_id: Some(detail_token),
         },
     )?;
@@ -537,6 +576,23 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
         {
             return Err("invalid or duplicate built-ins agent id".into());
         }
+        let mut item_ids = std::collections::HashSet::new();
+        for item in &summary.items {
+            if !valid(&item.id)
+                || !valid(&item.name)
+                || item
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| !valid(description))
+                || item
+                    .exception
+                    .as_deref()
+                    .is_some_and(|exception| !valid(exception))
+                || !item_ids.insert(item.id.as_str())
+            {
+                return Err("invalid or duplicate built-in item id".into());
+            }
+        }
     }
     for node in &reply.agents {
         if let Some(parent) = &node.parent_id
@@ -698,6 +754,16 @@ mod tests {
         assert!(load_config(&path).unwrap_err().contains("absolute"));
     }
 
+    #[test]
+    fn builtin_items_default_for_older_collectors() {
+        let reply: Reply = serde_json::from_str(
+            r#"{"version":1,"agents":[{"id":"agent","label":"main"}],"builtins":[{"agent_id":"agent","tools_count":4,"skills_count":2}]}"#,
+        )
+        .unwrap();
+        assert!(reply.builtins[0].items.is_empty());
+        validate_reply(&reply).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn fake_provider_reply_is_bounded_and_validated() {
@@ -707,7 +773,7 @@ mod tests {
         let script = dir.path().join("collector");
         std::fs::write(
             &script,
-            "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in *'\"cwd\":\"/tmp/project\"'*) ;; *) exit 7 ;; esac\nprintf '%s' '{\"version\":1,\"agents\":[{\"id\":\"root\",\"label\":\"main\"}],\"facts\":[{\"id\":\"model\",\"agent_id\":\"root\",\"category\":\"model\",\"label\":\"model\",\"evidence\":\"observed\"}]}'\n",
+            "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in *'\"cwd\":\"/tmp/project\"'*'\"pane_pid\":42'*'\"current_command\":\"claude\"'*) ;; *) exit 7 ;; esac\nprintf '%s' '{\"version\":1,\"agents\":[{\"id\":\"root\",\"label\":\"main\"}],\"facts\":[{\"id\":\"model\",\"agent_id\":\"root\",\"category\":\"model\",\"label\":\"model\",\"evidence\":\"observed\"}]}'\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
@@ -731,6 +797,8 @@ mod tests {
             "%1",
             Some("/tmp/project"),
             Some("session"),
+            Some(42),
+            Some("claude"),
         )
         .unwrap();
         assert_eq!(reply.facts[0].id, "model");
@@ -773,6 +841,8 @@ mod tests {
             pane_id: "%1",
             cwd: Some(cwd.to_str().unwrap()),
             session_id: Some("session-1"),
+            pane_pid: Some(4242),
+            current_command: Some("claude"),
             subagent_id: None,
         };
         let mut child = Command::new("/usr/bin/python3")
@@ -786,7 +856,16 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        serde_json::to_writer(child.stdin.as_mut().unwrap(), &request).unwrap();
+        let request_json = serde_json::to_vec(&request).unwrap();
+        let request_text = String::from_utf8_lossy(&request_json);
+        assert!(request_text.contains("\"pane_pid\":4242"));
+        assert!(request_text.contains("\"current_command\":\"claude\""));
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&request_json)
+            .unwrap();
         child.stdin.as_mut().unwrap().flush().unwrap();
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());

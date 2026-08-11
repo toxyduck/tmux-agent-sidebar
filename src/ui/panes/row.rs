@@ -4,7 +4,7 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet};
 
-use crate::state::{CapabilityUiState, TreeTarget};
+use crate::state::{CapabilityUiState, InlineDetail, TreeTarget};
 use crate::tmux::PaneStatus;
 use crate::ui::colors::ColorTheme;
 use crate::ui::icons::StatusIcons;
@@ -106,6 +106,7 @@ pub(super) fn render_extension_tree(
             agent_id: fact.agent_id.clone(),
             node_id: format!("fact:{}", fact.id),
             detail_token: fact.detail_token.clone(),
+            inline_detail: None,
             is_disclosure: false,
         };
         (line, target)
@@ -172,6 +173,7 @@ pub(super) fn render_extension_tree(
                 agent_id: node.agent_id.clone(),
                 node_id: node.id.clone(),
                 detail_token: node.detail_token.clone(),
+                inline_detail: None,
                 is_disclosure: has_content,
             },
         ));
@@ -234,10 +236,52 @@ pub(super) fn render_extension_tree(
                 agent_id: builtins.agent_id.clone(),
                 node_id: builtins_id.to_string(),
                 detail_token: None,
+                inline_detail: None,
                 is_disclosure: true,
             },
         ));
         if expanded {
+            for item in &builtins.items {
+                let kind = match item.kind {
+                    crate::extension::BuiltinKind::Tool => "tool",
+                    crate::extension::BuiltinKind::Skill => "skill",
+                };
+                let evidence = match item.evidence {
+                    crate::extension::Evidence::Observed => "●",
+                    crate::extension::Evidence::Available => "○",
+                    crate::extension::Evidence::Inferred => "~",
+                    crate::extension::Evidence::Error => "×",
+                    crate::extension::Evidence::Unknown => "?",
+                };
+                let exception = item
+                    .exception
+                    .as_deref()
+                    .map(|reason| format!(" × {reason}"))
+                    .unwrap_or_default();
+                let text = truncate_to_width(
+                    &format!("    {evidence} {kind}: {}{exception}", item.name),
+                    ctx.inner_width,
+                );
+                let width = display_width(&text);
+                lines.push((
+                    ctx.row_line(
+                        vec![Span::styled(text, Style::default().fg(theme.text_muted))],
+                        width,
+                    ),
+                    TreeTarget {
+                        parent_pane_id: pane_id.to_string(),
+                        provider_id: provider_id.to_string(),
+                        agent_id: builtins.agent_id.clone(),
+                        node_id: format!("builtin:{}:{}", builtins.agent_id, item.id),
+                        detail_token: None,
+                        inline_detail: item.description.as_ref().map(|description| InlineDetail {
+                            title: item.name.clone(),
+                            text: description.clone(),
+                        }),
+                        is_disclosure: false,
+                    },
+                ));
+            }
             for fact in exceptions {
                 lines.push(fact_line(fact, 1));
             }
@@ -263,6 +307,7 @@ pub(super) fn render_extension_tree(
                     agent_id: selected_agent_id.to_string(),
                     node_id: format!("slot:{}", slot.id),
                     detail_token: None,
+                    inline_detail: None,
                     is_disclosure: false,
                 },
             ));
@@ -281,6 +326,7 @@ pub(super) fn render_extension_tree(
                 agent_id: selected_agent_id.to_string(),
                 node_id: "__stale__".into(),
                 detail_token: None,
+                inline_detail: None,
                 is_disclosure: false,
             },
         ));
@@ -298,6 +344,7 @@ pub(super) fn render_extension_tree(
                 agent_id: selected_agent_id.to_string(),
                 node_id: "__error__".into(),
                 detail_token: None,
+                inline_detail: None,
                 is_disclosure: false,
             },
         ));
@@ -399,7 +446,8 @@ pub(super) fn render_pane_lines_with_ports(
 mod tests {
     use super::*;
     use crate::extension::{
-        AgentNode, Evidence, ExtensionsConfig, Fact, Inspection, Reply, TreeNode,
+        AgentNode, BuiltinItem, BuiltinKind, BuiltinSummary, Evidence, ExtensionsConfig, Fact,
+        Inspection, Reply, TreeNode,
     };
     use crate::group::PaneGitInfo;
     use crate::state::CapabilityUiState;
@@ -496,6 +544,7 @@ mod tests {
                         source: String::new(),
                         detail_token: None,
                     }],
+                    items: vec![],
                 }],
                 tree: vec![TreeNode {
                     id: "skills".into(),
@@ -655,6 +704,125 @@ mod tests {
             .map(|(_, target)| target.node_id)
             .collect();
         assert_eq!(ids, vec!["child-skill", "fact:shared-child"]);
+    }
+
+    #[test]
+    fn builtins_expand_stable_tools_skills_and_exceptions_at_narrow_width() {
+        let inspection = Inspection {
+            stale: false,
+            reply: Reply {
+                version: 1,
+                agents: vec![AgentNode {
+                    id: "agent".into(),
+                    parent_id: None,
+                    label: "agent".into(),
+                    model: None,
+                }],
+                builtins: vec![BuiltinSummary {
+                    agent_id: "agent".into(),
+                    tools_count: 2,
+                    skills_count: 2,
+                    exceptions: vec![],
+                    items: vec![
+                        BuiltinItem {
+                            id: "read-tool".into(),
+                            name: "Read".into(),
+                            kind: BuiltinKind::Tool,
+                            description: Some("Reads files".into()),
+                            evidence: Evidence::Available,
+                            exception: None,
+                        },
+                        BuiltinItem {
+                            id: "read-skill".into(),
+                            name: "Read".into(),
+                            kind: BuiltinKind::Skill,
+                            description: None,
+                            evidence: Evidence::Observed,
+                            exception: None,
+                        },
+                        BuiltinItem {
+                            id: "shell".into(),
+                            name: "Shell".into(),
+                            kind: BuiltinKind::Tool,
+                            description: None,
+                            evidence: Evidence::Error,
+                            exception: Some("disabled".into()),
+                        },
+                        BuiltinItem {
+                            id: "plan".into(),
+                            name: "Plan".into(),
+                            kind: BuiltinKind::Skill,
+                            description: None,
+                            evidence: Evidence::Available,
+                            exception: None,
+                        },
+                    ],
+                }],
+                ..Reply::default()
+            },
+        };
+        let config = ExtensionsConfig {
+            version: 1,
+            ..ExtensionsConfig::default()
+        };
+        let mut ui = CapabilityUiState::default();
+        let collapsed = render_extension_tree(
+            Some(&inspection),
+            Some(&config),
+            "%1",
+            "claude",
+            Some("agent"),
+            &ui,
+            12,
+            &ColorTheme::default(),
+        );
+        let summary = collapsed
+            .iter()
+            .find(|(_, target)| target.node_id == "__builtins__")
+            .unwrap()
+            .1
+            .clone();
+        assert!(summary.is_disclosure);
+        ui.toggle(&summary);
+        let expanded = render_extension_tree(
+            Some(&inspection),
+            Some(&config),
+            "%1",
+            "claude",
+            Some("agent"),
+            &ui,
+            60,
+            &ColorTheme::default(),
+        );
+        let targets: Vec<_> = expanded.iter().map(|(_, target)| target).collect();
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.node_id == "builtin:agent:read-tool")
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.node_id == "builtin:agent:read-skill")
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.node_id == "builtin:agent:shell")
+        );
+        let read_tool = targets
+            .iter()
+            .find(|target| target.node_id == "builtin:agent:read-tool")
+            .unwrap();
+        assert_eq!(
+            read_tool.inline_detail.as_ref().unwrap().text,
+            "Reads files"
+        );
+        assert!(
+            expanded
+                .iter()
+                .any(|(line, _)| line_text(line).contains("× disabled"))
+        );
     }
 
     fn test_ctx<'a>(theme: &'a ColorTheme, inner_width: usize, active: bool) -> RowCtx<'a> {

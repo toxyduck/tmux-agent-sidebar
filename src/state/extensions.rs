@@ -14,7 +14,16 @@ pub struct TreeTarget {
     pub agent_id: String,
     pub node_id: String,
     pub detail_token: Option<String>,
+    /// Collector text already present in the inspect reply. It opens inline
+    /// without another provider RPC.
+    pub inline_detail: Option<InlineDetail>,
     pub is_disclosure: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineDetail {
+    pub title: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +82,8 @@ enum WorkerRequest {
     Inspect {
         key: CacheKey,
         cwd: Option<String>,
+        pane_pid: Option<u32>,
+        current_command: Option<String>,
         config: ExtensionsConfig,
     },
     Detail {
@@ -161,7 +172,16 @@ impl ExtensionsState {
 
     pub fn refresh(
         &mut self,
-        panes: impl Iterator<Item = (String, String, Option<String>, Option<String>)>,
+        panes: impl Iterator<
+            Item = (
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<u32>,
+                Option<String>,
+            ),
+        >,
     ) {
         self.reload_config(false);
         if self.last_refresh.elapsed() < Duration::from_secs(2) {
@@ -171,7 +191,7 @@ impl ExtensionsState {
         let Some(config) = self.config.clone() else {
             return;
         };
-        for (pane_id, provider, session_id, cwd) in panes {
+        for (pane_id, provider, session_id, cwd, pane_pid, current_command) in panes {
             let key = CacheKey::new(&provider, &pane_id, session_id.as_deref());
             if self.in_flight.contains(&key) {
                 continue;
@@ -179,6 +199,8 @@ impl ExtensionsState {
             match self.inspect_tx.try_send(WorkerRequest::Inspect {
                 key: key.clone(),
                 cwd,
+                pane_pid,
+                current_command,
                 config: config.clone(),
             }) {
                 Ok(()) => {
@@ -313,13 +335,21 @@ impl ExtensionsState {
 fn worker_loop(rx: Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerResult>) {
     while let Ok(request) = rx.recv() {
         let result = match request {
-            WorkerRequest::Inspect { key, cwd, config } => WorkerResult::Inspect {
+            WorkerRequest::Inspect {
+                key,
+                cwd,
+                pane_pid,
+                current_command,
+                config,
+            } => WorkerResult::Inspect {
                 result: extension::inspect_once(
                     &config,
                     &key.provider,
                     &key.pane_id,
                     cwd.as_deref(),
                     key.session_id.as_deref(),
+                    pane_pid,
+                    current_command.as_deref(),
                 ),
                 key,
             },

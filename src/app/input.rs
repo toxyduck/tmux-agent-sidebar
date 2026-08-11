@@ -162,7 +162,7 @@ pub(super) fn handle_key_event(
                     Some(crate::state::NavigationTarget::Tree(target)) => {
                         if target.is_disclosure {
                             state.extensions.ui.toggle(&target);
-                        } else if target.detail_token.is_some() {
+                        } else if target.detail_token.is_some() || target.inline_detail.is_some() {
                             state.open_selected_capability_detail();
                         }
                     }
@@ -364,6 +364,7 @@ mod tests {
             agent_id: "child".into(),
             node_id: "skill-a".into(),
             detail_token: Some("detail-a".into()),
+            inline_detail: None,
             is_disclosure: false,
         };
         state.layout.navigation_targets = vec![
@@ -450,6 +451,7 @@ mod tests {
             agent_id: "agent-1".into(),
             node_id: "skill:review".into(),
             detail_token: Some("detail-token".into()),
+            inline_detail: None,
             is_disclosure: false,
         };
         state.scrolls.panes.offset = 4;
@@ -480,6 +482,7 @@ mod tests {
             agent_id: "agent-1".into(),
             node_id: "skills".into(),
             detail_token: None,
+            inline_detail: None,
             is_disclosure: true,
         };
         state.extensions.ui.selected = Some(target.clone());
@@ -487,5 +490,32 @@ mod tests {
         handle_key_event(key(KeyCode::Char(' ')), &mut state, &flag);
         assert!(state.extensions.ui.is_expanded("%1", "skills"));
         assert_eq!(state.extensions.ui.selected, Some(target));
+    }
+
+    #[test]
+    fn enter_opens_inline_builtin_item_detail() {
+        let mut state = state_with_three_panes();
+        let target = crate::state::TreeTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "codex".into(),
+            agent_id: "agent-1".into(),
+            node_id: "builtin:agent-1:read".into(),
+            detail_token: None,
+            inline_detail: Some(crate::state::InlineDetail {
+                title: "Read".into(),
+                text: "Reads files".into(),
+            }),
+            is_disclosure: false,
+        };
+        state.extensions.ui.selected = Some(target.clone());
+        state.selected_navigation_target = Some(NavigationTarget::Tree(target));
+        let flag = AtomicBool::new(false);
+
+        handle_key_event(key(KeyCode::Enter), &mut state, &flag);
+        assert_eq!(state.extensions.ui.detail.as_ref().unwrap().title, "Read");
+        assert_eq!(
+            state.extensions.ui.detail.as_ref().unwrap().text,
+            "Reads files"
+        );
     }
 }

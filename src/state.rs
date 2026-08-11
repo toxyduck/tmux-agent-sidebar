@@ -82,6 +82,12 @@ pub struct AppState {
     /// mouse click; it is cleared whenever the pane list is rebuilt.
     pub selected_subagent_target: Option<SubagentTarget>,
     pub selected_navigation_target: Option<NavigationTarget>,
+    /// Set only by an explicit list-navigation action. Rendering consumes it
+    /// once to reveal the selection; ordinary redraws preserve manual scroll.
+    pub pane_selection_reveal_pending: bool,
+    /// Selection that was last considered for automatic reveal. This also
+    /// recognises cursor changes received from another sidebar instance.
+    pub last_revealed_pane_row: Option<usize>,
     /// Periodic-refresh clocks (port scan, session-name scan, filter
     /// debounce, port-scan first-run flag).
     pub timers: RefreshTimers,
@@ -158,8 +164,8 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Uniform child activation: focus the original pane, then ask the
-    /// provider collector to open its native viewer. No pane/session is made.
+    /// Uniform child activation reserves the collector slot before changing
+    /// focus. No pane/session is made.
     pub fn activate_subagent(&mut self, target: SubagentTarget) {
         if !self.subagent_target_matches_live_inspection(&target) {
             self.set_flash("Native viewer unavailable: stale subagent target".to_string());
@@ -179,12 +185,23 @@ impl AppState {
             }
             return;
         }
+        let request_id = match self.extensions.reserve_native_activation(&target) {
+            Ok(None) => return,
+            Ok(Some(request_id)) => request_id,
+            Err(error) => {
+                self.set_flash(format!("Native viewer unavailable: {error}"));
+                return;
+            }
+        };
         crate::tmux::select_pane(&target.parent_pane_id);
         let (_, cwd, pane_pid, current_command) = self.pane_context(&target.parent_pane_id);
-        if let Err(error) = self
-            .extensions
-            .queue_activate(target, cwd, pane_pid, current_command)
-        {
+        if let Err(error) = self.extensions.dispatch_native_activation(
+            request_id,
+            target,
+            cwd,
+            pane_pid,
+            current_command,
+        ) {
             self.set_flash(format!("Native viewer unavailable: {error}"));
         }
     }
@@ -344,6 +361,8 @@ impl AppState {
             extensions: ExtensionsState::load(),
             selected_subagent_target: None,
             selected_navigation_target: None,
+            pane_selection_reveal_pending: false,
+            last_revealed_pane_row: None,
             timers: RefreshTimers::default(),
             popup: PopupState::None,
             notices: NoticesState::default(),
@@ -422,6 +441,7 @@ impl AppState {
             }
         }
         self.selected_navigation_target = Some(target);
+        self.pane_selection_reveal_pending = true;
         true
     }
 }
@@ -457,12 +477,19 @@ impl AppState {
                     target,
                     result,
                 } => {
-                    let pending = self.extensions.pending_native_open.take();
-                    if pending.as_ref().is_none_or(|pending| {
-                        pending.id != request_id
-                            || pending.target != target
-                            || !self.subagent_target_matches_live_inspection(&target)
-                    }) {
+                    let Some(_) = self
+                        .extensions
+                        .release_native_execution(request_id, &target)
+                    else {
+                        continue;
+                    };
+                    let Some(_) = self
+                        .extensions
+                        .take_pending_native_open(request_id, &target)
+                    else {
+                        continue;
+                    };
+                    if !self.subagent_target_matches_live_inspection(&target) {
                         continue;
                     }
                     match result {

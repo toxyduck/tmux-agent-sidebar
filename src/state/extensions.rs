@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -411,12 +413,18 @@ pub struct ExtensionsState {
     last_refresh: Instant,
     pub ui: CapabilityUiState,
     next_request_id: u64,
+    /// Physical worker ownership. It is released only by the matching
+    /// `WorkerResult::Activate`, because a queued request cannot be cancelled.
+    native_execution: Option<PendingNativeOpen>,
+    /// UI intent. Scope/config/target invalidation may cancel this without
+    /// releasing `native_execution`; a late result then has no UI effect.
     pub pending_native_open: Option<PendingNativeOpen>,
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TestActivationRequest {
+    pub id: u64,
     pub target: crate::state::SubagentTarget,
     pub cwd: Option<String>,
     pub pane_pid: Option<u32>,
@@ -424,19 +432,24 @@ pub(crate) struct TestActivationRequest {
 }
 
 #[cfg(test)]
-pub(crate) struct TestControlQueue(Receiver<WorkerRequest>);
+pub(crate) struct TestControlQueue {
+    requests: Receiver<WorkerRequest>,
+    results: mpsc::Sender<WorkerResult>,
+}
 
 #[cfg(test)]
 impl TestControlQueue {
     pub(crate) fn take_activation(&self) -> Option<TestActivationRequest> {
-        match self.0.try_recv().ok()? {
+        match self.requests.try_recv().ok()? {
             WorkerRequest::Activate {
+                request_id,
                 target,
                 cwd,
                 pane_pid,
                 current_command,
                 ..
             } => Some(TestActivationRequest {
+                id: request_id,
                 target,
                 cwd,
                 pane_pid,
@@ -445,6 +458,35 @@ impl TestControlQueue {
             _ => None,
         }
     }
+
+    pub(crate) fn complete_activation(
+        &self,
+        request: &TestActivationRequest,
+        result: Result<Reply, String>,
+    ) {
+        self.results
+            .send(WorkerResult::Activate {
+                request_id: request.id,
+                target: request.target.clone(),
+                result,
+            })
+            .expect("test result receiver stays open");
+    }
+
+    pub(crate) fn complete_inspect(
+        &self,
+        pane_id: &str,
+        provider: &str,
+        session_id: Option<&str>,
+        result: Result<Reply, String>,
+    ) {
+        self.results
+            .send(WorkerResult::Inspect {
+                key: CacheKey::new(provider, pane_id, session_id),
+                result,
+            })
+            .expect("test result receiver stays open");
+    }
 }
 
 impl ExtensionsState {
@@ -452,7 +494,7 @@ impl ExtensionsState {
     pub(crate) fn with_test_control_queue(config: ExtensionsConfig) -> (Self, TestControlQueue) {
         let (inspect_tx, _inspect_rx) = mpsc::sync_channel(1);
         let (control_tx, control_rx) = mpsc::sync_channel(8);
-        let (_result_tx, rx) = mpsc::channel();
+        let (result_tx, rx) = mpsc::channel();
         (
             Self {
                 config: Some(config),
@@ -467,9 +509,13 @@ impl ExtensionsState {
                 last_refresh: Instant::now(),
                 ui: CapabilityUiState::default(),
                 next_request_id: 0,
+                native_execution: None,
                 pending_native_open: None,
             },
-            TestControlQueue(control_rx),
+            TestControlQueue {
+                requests: control_rx,
+                results: result_tx,
+            },
         )
     }
 
@@ -515,6 +561,7 @@ impl ExtensionsState {
             last_refresh: Instant::now() - Duration::from_secs(2),
             ui: CapabilityUiState::default(),
             next_request_id: 0,
+            native_execution: None,
             pending_native_open: None,
         };
         state.reload_config(true);
@@ -613,19 +660,55 @@ impl ExtensionsState {
             })
     }
 
-    pub fn queue_activate(
+    /// Reserve the one native viewer slot before changing focus. A duplicate
+    /// click is intentionally coalesced; a distinct target is rejected so it
+    /// cannot overwrite the request that will receive the provider result.
+    pub fn reserve_native_activation(
         &mut self,
+        target: &crate::state::SubagentTarget,
+    ) -> Result<Option<u64>, String> {
+        if let Some(pending) = &self.native_execution {
+            return if pending.target == *target {
+                Ok(None)
+            } else {
+                Err("another subagent activation is in progress".to_string())
+            };
+        }
+        if self.config.is_none() {
+            return Err("no provider collector configured".to_string());
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let pending = PendingNativeOpen {
+            id: request_id,
+            target: target.clone(),
+        };
+        self.native_execution = Some(pending.clone());
+        self.pending_native_open = Some(pending);
+        Ok(Some(request_id))
+    }
+
+    /// Dispatch a previously reserved activation. Failures clear only the
+    /// matching reservation, preserving a separately tracked request.
+    pub fn dispatch_native_activation(
+        &mut self,
+        request_id: u64,
         target: crate::state::SubagentTarget,
         cwd: Option<String>,
         pane_pid: Option<u32>,
         current_command: Option<String>,
-    ) -> Result<u64, String> {
-        let config = self
-            .config
-            .clone()
-            .ok_or_else(|| "no provider collector configured".to_string())?;
-        let request_id = self.next_request_id;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
+    ) -> Result<(), String> {
+        let Some(config) = self.config.clone() else {
+            self.clear_native_activation(request_id, &target);
+            return Err("no provider collector configured".to_string());
+        };
+        if !self
+            .native_execution
+            .as_ref()
+            .is_some_and(|pending| pending.id == request_id && pending.target == target)
+        {
+            return Err("activation reservation expired".to_string());
+        }
         self.control_tx
             .try_send(WorkerRequest::Activate {
                 request_id,
@@ -635,17 +718,62 @@ impl ExtensionsState {
                 current_command,
                 config,
             })
-            .map(|()| {
-                self.pending_native_open = Some(PendingNativeOpen {
-                    id: request_id,
-                    target,
-                });
-                request_id
-            })
             .map_err(|error| match error {
                 TrySendError::Full(_) => "collector queue is full".to_string(),
                 TrySendError::Disconnected(_) => "collector worker stopped".to_string(),
             })
+            .inspect_err(|_| self.clear_native_activation(request_id, &target))
+    }
+
+    /// Releases the physical worker slot. A late or foreign result cannot
+    /// clear a newer execution ownership.
+    pub fn release_native_execution(
+        &mut self,
+        request_id: u64,
+        target: &crate::state::SubagentTarget,
+    ) -> Option<PendingNativeOpen> {
+        if self
+            .native_execution
+            .as_ref()
+            .is_some_and(|pending| pending.id == request_id && pending.target == *target)
+        {
+            self.native_execution.take()
+        } else {
+            None
+        }
+    }
+
+    pub fn take_pending_native_open(
+        &mut self,
+        request_id: u64,
+        target: &crate::state::SubagentTarget,
+    ) -> Option<PendingNativeOpen> {
+        if self
+            .pending_native_open
+            .as_ref()
+            .is_some_and(|pending| pending.id == request_id && pending.target == *target)
+        {
+            self.pending_native_open.take()
+        } else {
+            None
+        }
+    }
+
+    fn clear_native_activation(&mut self, request_id: u64, target: &crate::state::SubagentTarget) {
+        if self
+            .pending_native_open
+            .as_ref()
+            .is_some_and(|pending| pending.id == request_id && pending.target == *target)
+        {
+            self.pending_native_open = None;
+        }
+        if self
+            .native_execution
+            .as_ref()
+            .is_some_and(|pending| pending.id == request_id && pending.target == *target)
+        {
+            self.native_execution = None;
+        }
     }
 
     pub fn queue_transcript(
@@ -904,6 +1032,7 @@ mod tests {
                 last_refresh: Instant::now(),
                 ui: CapabilityUiState::default(),
                 next_request_id: 0,
+                native_execution: None,
                 pending_native_open: None,
             },
             result_tx,
@@ -963,6 +1092,137 @@ mod tests {
         let first = CacheKey::new("claude", "%1", Some("one"));
         let second = CacheKey::new("claude", "%1", Some("two"));
         assert_ne!(first, second);
+    }
+
+    fn activation_config() -> ExtensionsConfig {
+        ExtensionsConfig {
+            providers: BTreeMap::from([(
+                "claude".into(),
+                extension::ProviderConfig {
+                    argv: vec!["/bin/true".into()],
+                    timeout_ms: 100,
+                    env: BTreeMap::new(),
+                },
+            )]),
+            ..ExtensionsConfig::default()
+        }
+    }
+
+    fn activation_target(agent_id: &str) -> crate::state::SubagentTarget {
+        crate::state::SubagentTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            session_id: Some("session".into()),
+            agent_id: agent_id.into(),
+            node_id: agent_id.into(),
+        }
+    }
+
+    fn queue_activation(
+        state: &mut ExtensionsState,
+        queue: &TestControlQueue,
+        target: &crate::state::SubagentTarget,
+    ) -> TestActivationRequest {
+        let request_id = state
+            .reserve_native_activation(target)
+            .unwrap()
+            .expect("first activation reserves the worker");
+        state
+            .dispatch_native_activation(request_id, target.clone(), None, None, None)
+            .unwrap();
+        queue.take_activation().expect("activation was queued")
+    }
+
+    #[test]
+    fn scope_invalidation_cancels_ui_intent_without_releasing_execution_lock() {
+        let (mut state, queue) = ExtensionsState::with_test_control_queue(activation_config());
+        let first = activation_target("first");
+        let second = activation_target("second");
+        let request = queue_activation(&mut state, &queue, &first);
+
+        state.refresh(std::iter::empty());
+        assert!(state.pending_native_open.is_none());
+        assert!(state.native_execution.is_some());
+        assert_eq!(
+            state.reserve_native_activation(&second),
+            Err("another subagent activation is in progress".into())
+        );
+
+        assert!(state.release_native_execution(request.id, &first).is_some());
+        assert!(state.reserve_native_activation(&second).unwrap().is_some());
+    }
+
+    #[test]
+    fn target_removal_cancels_ui_intent_without_releasing_execution_lock() {
+        let (mut state, queue) = ExtensionsState::with_test_control_queue(activation_config());
+        let first = activation_target("first");
+        let second = activation_target("second");
+        let request = queue_activation(&mut state, &queue, &first);
+
+        queue.complete_inspect(
+            "%1",
+            "claude",
+            Some("session"),
+            Ok(Reply {
+                version: extension::PROTOCOL_VERSION,
+                ..Reply::default()
+            }),
+        );
+        state.take_results();
+        assert!(state.pending_native_open.is_none());
+        assert!(state.native_execution.is_some());
+        assert_eq!(
+            state.reserve_native_activation(&second),
+            Err("another subagent activation is in progress".into())
+        );
+
+        assert!(state.release_native_execution(request.id, &first).is_some());
+        assert!(state.reserve_native_activation(&second).unwrap().is_some());
+    }
+
+    #[test]
+    fn config_reload_cancels_ui_intent_without_releasing_execution_lock() {
+        let (mut state, queue) = ExtensionsState::with_test_control_queue(activation_config());
+        let first = activation_target("first");
+        let second = activation_target("second");
+        let request = queue_activation(&mut state, &queue, &first);
+
+        state.reload_config(true);
+        assert!(state.pending_native_open.is_none());
+        assert!(state.native_execution.is_some());
+        state.config = Some(activation_config());
+        assert_eq!(
+            state.reserve_native_activation(&second),
+            Err("another subagent activation is in progress".into())
+        );
+
+        assert!(state.release_native_execution(request.id, &first).is_some());
+        assert!(state.reserve_native_activation(&second).unwrap().is_some());
+    }
+
+    #[test]
+    fn late_result_cannot_release_newer_execution_lock() {
+        let (mut state, queue) = ExtensionsState::with_test_control_queue(activation_config());
+        let first = activation_target("first");
+        let second = activation_target("second");
+        let first_request = queue_activation(&mut state, &queue, &first);
+
+        assert!(
+            state
+                .release_native_execution(first_request.id, &first)
+                .is_some()
+        );
+        let second_request = queue_activation(&mut state, &queue, &second);
+
+        assert!(
+            state
+                .release_native_execution(first_request.id, &first)
+                .is_none()
+        );
+        assert_eq!(
+            state.native_execution.as_ref().map(|pending| pending.id),
+            Some(second_request.id)
+        );
     }
 
     #[test]

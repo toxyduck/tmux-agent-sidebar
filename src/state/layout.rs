@@ -155,6 +155,8 @@ impl AppState {
             self.scroll_bottom(delta);
         } else {
             self.scrolls.panes.scroll(delta);
+            self.pane_selection_reveal_pending = false;
+            self.last_revealed_pane_row = Some(self.global.selected_pane_row);
         }
     }
 
@@ -357,6 +359,7 @@ impl AppState {
             self.extensions.ui.selected = None;
             self.selected_subagent_target = None;
             self.selected_navigation_target = Some(NavigationTarget::Pane { row: *agent_row });
+            self.pane_selection_reveal_pending = true;
             self.global.queue_cursor_save();
         }
     }

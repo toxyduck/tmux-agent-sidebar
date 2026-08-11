@@ -431,8 +431,12 @@ fn compute_scroll_offset(state: &mut AppState, total_lines: usize, list_area: Re
     let max_offset = total_lines.saturating_sub(visible_h);
     state.scrolls.panes.offset = state.scrolls.panes.offset.min(max_offset);
 
-    // Auto-scroll to keep selected agent visible
-    if state.focus_state.sidebar_focused
+    // Auto-reveal is a one-shot response to intentional keyboard/mouse
+    // selection navigation. Refreshes and focus changes must preserve a
+    // manually scrolled viewport.
+    let selection_changed = state.last_revealed_pane_row != Some(state.global.selected_pane_row);
+    if (state.pane_selection_reveal_pending || selection_changed)
+        && state.focus_state.sidebar_focused
         && state.focus_state.focus == Focus::Panes
         && visible_h > 0
         && let Some((first, last)) = selected_block_lines(state)
@@ -459,6 +463,8 @@ fn compute_scroll_offset(state: &mut AppState, total_lines: usize, list_area: Re
         } else if last >= offset.saturating_add(visible_h) {
             state.scrolls.panes.offset = (last + 1).saturating_sub(visible_h);
         }
+        state.pane_selection_reveal_pending = false;
+        state.last_revealed_pane_row = Some(state.global.selected_pane_row);
     }
 
     state.scrolls.panes.offset.min(max_offset)
@@ -808,6 +814,7 @@ mod tests {
         state.global.selected_pane_row = 0;
         state.layout.line_to_row = line_to_row;
         state.scrolls.panes.offset = offset;
+        state.pane_selection_reveal_pending = true;
         state
     }
 
@@ -875,6 +882,39 @@ mod tests {
 
         state.scrolls.panes.offset = 99;
         assert_eq!(compute_scroll_offset(&mut state, 30, list_area(18)), 12);
+    }
+
+    #[test]
+    fn manual_pane_scroll_survives_redraws_focus_changes_and_refreshes() {
+        let mut state = focused_scroll_state(vec![Some(0); 60], 18);
+        state.pane_selection_reveal_pending = false;
+
+        for _ in 0..30 {
+            assert_eq!(compute_scroll_offset(&mut state, 60, list_area(18)), 18);
+        }
+        state.focus_state.sidebar_focused = false;
+        assert_eq!(compute_scroll_offset(&mut state, 60, list_area(18)), 18);
+        state.focus_state.sidebar_focused = true;
+        assert_eq!(compute_scroll_offset(&mut state, 60, list_area(18)), 18);
+    }
+
+    #[test]
+    fn intentional_selection_navigation_reveals_once_then_preserves_scroll() {
+        let mut lines = vec![None; 20];
+        lines.extend(std::iter::repeat_n(Some(0), 3));
+        let mut state = focused_scroll_state(lines, 0);
+        assert_eq!(compute_scroll_offset(&mut state, 23, list_area(18)), 5);
+        assert!(!state.pane_selection_reveal_pending);
+        state.scrolls.panes.offset = 2;
+        assert_eq!(compute_scroll_offset(&mut state, 23, list_area(18)), 2);
+    }
+
+    #[test]
+    fn manual_scroll_is_clamped_after_resize_without_revealing_selection() {
+        let mut state = focused_scroll_state(vec![Some(0); 30], 99);
+        state.pane_selection_reveal_pending = false;
+        assert_eq!(compute_scroll_offset(&mut state, 30, list_area(18)), 12);
+        assert_eq!(compute_scroll_offset(&mut state, 30, list_area(40)), 0);
     }
 
     #[test]

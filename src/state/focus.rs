@@ -76,6 +76,7 @@ impl AppState {
             self.global.selected_pane_row = next as usize;
             self.extensions.ui.selected = None;
             self.selected_subagent_target = None;
+            self.pane_selection_reveal_pending = true;
             true
         } else {
             false

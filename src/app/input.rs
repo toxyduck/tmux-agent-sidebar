@@ -409,6 +409,15 @@ mod tests {
                         lifecycle: Default::default(),
                         transcript_available: false,
                     },
+                    AgentNode {
+                        id: "other-worker".into(),
+                        parent_id: Some("main".into()),
+                        label: "Other worker".into(),
+                        role: AgentRole::Subagent,
+                        model: None,
+                        lifecycle: Default::default(),
+                        transcript_available: false,
+                    },
                 ],
                 ..Reply::default()
             },
@@ -461,6 +470,93 @@ mod tests {
         assert_eq!(mouse_request.cwd.as_deref(), Some(expected_cwd.as_str()));
         assert_eq!(mouse_request.pane_pid, Some(42));
         assert_eq!(mouse_request.current_command.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn repeated_same_subagent_activation_coalesces_before_focus_and_enqueue() {
+        let _guard = crate::tmux::test_mock::install();
+        let (mut state, queue, subagent, _) = activation_ready_state();
+
+        for _ in 0..20 {
+            state.activate_subagent(subagent.clone());
+        }
+
+        let request = queue.take_activation().expect("one activation request");
+        assert_eq!(request.target, subagent);
+        assert!(queue.take_activation().is_none());
+        assert!(state.flash.is_none());
+    }
+
+    #[test]
+    fn distinct_subagent_activation_is_rejected_without_replacing_pending_request() {
+        let _guard = crate::tmux::test_mock::install();
+        let (mut state, queue, first, _) = activation_ready_state();
+        let second = SubagentTarget {
+            agent_id: "other-worker".into(),
+            ..first.clone()
+        };
+
+        state.activate_subagent(first.clone());
+        state.activate_subagent(second);
+
+        assert_eq!(
+            queue.take_activation().expect("first request").target,
+            first
+        );
+        assert!(queue.take_activation().is_none());
+        assert_eq!(
+            state.flash.as_ref().map(|(message, _)| message.as_str()),
+            Some("Native viewer unavailable: another subagent activation is in progress")
+        );
+    }
+
+    #[test]
+    fn activation_error_clears_matching_pending_request() {
+        let _guard = crate::tmux::test_mock::install();
+        let (mut state, queue, subagent, _) = activation_ready_state();
+
+        state.activate_subagent(subagent.clone());
+        let request = queue.take_activation().expect("activation request");
+        queue.complete_activation(&request, Err("adapter failed".into()));
+        state.apply_extension_results();
+
+        assert!(state.extensions.pending_native_open.is_none());
+        assert_eq!(
+            state.flash.as_ref().map(|(message, _)| message.as_str()),
+            Some("Native viewer unavailable: adapter failed")
+        );
+    }
+
+    #[test]
+    fn exact_activation_result_releases_lock_and_late_result_cannot_clear_next_intent() {
+        let _guard = crate::tmux::test_mock::install();
+        let (mut state, queue, first, _) = activation_ready_state();
+        let second = SubagentTarget {
+            agent_id: "other-worker".into(),
+            ..first.clone()
+        };
+
+        state.activate_subagent(first.clone());
+        let first_request = queue.take_activation().expect("first activation");
+        queue.complete_activation(&first_request, Ok(Reply::default()));
+        state.apply_extension_results();
+
+        state.activate_subagent(second.clone());
+        let second_request = queue.take_activation().expect("second activation");
+        queue.complete_activation(&first_request, Err("late result".into()));
+        state.apply_extension_results();
+
+        assert_eq!(
+            state
+                .extensions
+                .pending_native_open
+                .as_ref()
+                .map(|pending| &pending.target),
+            Some(&second)
+        );
+        state.activate_subagent(second);
+        assert!(queue.take_activation().is_none());
+        assert_ne!(first_request.id, second_request.id);
     }
 
     #[test]

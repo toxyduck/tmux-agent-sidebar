@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 /// How long a PR lookup stays fresh before `PrCache` refetches it. PR numbers
@@ -57,9 +58,15 @@ impl VcsKind {
 /// Detect the VCS at `path`. Arc is tested first: an Arc mount can contain a
 /// git metadata directory but must never be queried with git commands.
 pub fn fetch_vcs_entry(path: &str) -> Option<VcsEntry> {
-    if let Some(root) = run_command(path, "arc", &["root"]) {
-        let branch = run_command(&root, "arc", &["branch"]).unwrap_or_else(|| "(no branch)".into());
-        let diff_stat = run_command(&root, "arc", &["diff", "--stat", "--no-color", "--git"])
+    if let Some(root) = run_command_text(path, "arc", &["root"]) {
+        let branch = run_command_text(&root, "arc", &["status", "--branch", "--json"])
+            .and_then(|json| parse_arc_branch_json(&json))
+            .or_else(|| {
+                run_command_text(&root, "arc", &["status", "--branch"])
+                    .and_then(|text| parse_arc_branch_text(&text))
+            })
+            .unwrap_or_else(|| "HEAD".into());
+        let diff_stat = run_command_text(&root, "arc", &["diff", "--stat", "--no-color", "--git"])
             .as_deref()
             .and_then(parse_diff_stat);
         return Some(VcsEntry {
@@ -99,33 +106,145 @@ pub fn fetch_vcs_entries(paths: impl IntoIterator<Item = String>) -> Vec<VcsEntr
 /// Current patch for a repository. Git includes both index and worktree
 /// changes; Arc delegates patch generation to `arc diff --git`.
 pub fn vcs_patch(kind: VcsKind, root: &str) -> Result<String, String> {
+    String::from_utf8(vcs_patch_bytes(kind, root)?).map_err(|_| "patch is not UTF-8".into())
+}
+
+/// Return the exact bytes supplied by the VCS. No output is trimmed: a final
+/// newline is part of a unified diff and must reach the viewer unchanged.
+pub fn vcs_patch_bytes(kind: VcsKind, root: &str) -> Result<Vec<u8>, String> {
     match kind {
         VcsKind::Git => {
-            let staged =
-                run_command(root, "git", &["diff", "--cached", "--no-color"]).unwrap_or_default();
-            let unstaged = run_command(root, "git", &["diff", "--no-color"]).unwrap_or_default();
-            Ok([staged, unstaged]
-                .into_iter()
-                .filter(|patch| !patch.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n"))
+            let mut patch =
+                git_output(root, &["diff", "--cached", "--no-color", "--binary"], false)?.stdout;
+            patch.extend(git_output(root, &["diff", "--no-color", "--binary"], false)?.stdout);
+            for path in git_untracked_paths(root)? {
+                // `--no-index` intentionally returns 1 when a diff exists.
+                patch.extend(
+                    git_output(
+                        root,
+                        &[
+                            "diff",
+                            "--no-index",
+                            "--no-color",
+                            "--binary",
+                            "/dev/null",
+                            &path,
+                        ],
+                        true,
+                    )?
+                    .stdout,
+                );
+            }
+            Ok(patch)
         }
-        VcsKind::Arc => run_command(root, "arc", &["diff", "--no-color", "--git"])
-            .ok_or_else(|| "arc diff failed".to_string()),
+        VcsKind::Arc => command_output(root, "arc", &["diff", "--no-color", "--git"], false)
+            .map(|output| output.stdout),
     }
 }
 
-fn run_command(path: &str, program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program)
+fn command_output(
+    path: &str,
+    program: &str,
+    args: &[&str],
+    allow_diff_exit: bool,
+) -> Result<Output, String> {
+    let mut child = Command::new(program)
         .args(args)
         .current_dir(path)
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot launch {program}: {error}"))?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            let status = child.wait().map_err(|error| error.to_string())?;
+            let stdout = stdout_reader
+                .join()
+                .map_err(|_| "stdout reader panicked".to_string())?
+                .map_err(|error| error.to_string())?;
+            let stderr = stderr_reader
+                .join()
+                .map_err(|_| "stderr reader panicked".to_string())?
+                .map_err(|error| error.to_string())?;
+            let output = Output {
+                status,
+                stdout,
+                stderr,
+            };
+            if output.status.success() || (allow_diff_exit && output.status.code() == Some(1)) {
+                return Ok(output);
+            }
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(format!("{program} timed out"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn run_command_text(path: &str, program: &str, args: &[&str]) -> Option<String> {
+    let output = command_output(path, program, args, false).ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn git_output(path: &str, args: &[&str], allow_diff_exit: bool) -> Result<Output, String> {
+    command_output(path, "git", args, allow_diff_exit)
+}
+
+fn git_untracked_paths(root: &str) -> Result<Vec<String>, String> {
+    let output = git_output(
+        root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        false,
+    )?;
+    let fields = output.stdout.split(|byte| *byte == 0);
+    Ok(fields
+        .filter(|field| field.starts_with(b"?? "))
+        .map(|field| String::from_utf8_lossy(&field[3..]).into_owned())
+        .collect())
+}
+
+pub(crate) fn parse_arc_branch_json(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    ["branch", "current_branch", "currentBranch"]
+        .into_iter()
+        .find_map(|key| {
+            value
+                .get(key)
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+        .filter(|branch| !branch.is_empty())
+}
+
+pub(crate) fn parse_arc_branch_text(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("* ")
+            .or_else(|| line.trim().strip_prefix("current: "))
+            .map(str::to_owned)
+    })
 }
 
 impl GitData {
@@ -832,5 +951,51 @@ mod tests {
         );
         assert!(pr.is_none());
         assert_eq!(calls.get(), 1, "second call must hit the cached None");
+    }
+
+    #[test]
+    fn parses_arc_status_branch_json_and_detached_state() {
+        assert_eq!(
+            parse_arc_branch_json(r#"{"branch":"users/alice/topic"}"#).as_deref(),
+            Some("users/alice/topic")
+        );
+        assert_eq!(parse_arc_branch_json(r#"{"branch":null}"#), None);
+        assert_eq!(
+            parse_arc_branch_text("  main\n* users/alice/topic\n").as_deref(),
+            Some("users/alice/topic")
+        );
+        assert_eq!(parse_arc_branch_text("detached HEAD\n"), None);
+    }
+
+    #[test]
+    fn git_patch_contains_staged_unstaged_untracked_and_final_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["init", "-q"]).status.success());
+        assert!(
+            run(&["config", "user.email", "test@example.invalid"])
+                .status
+                .success()
+        );
+        assert!(run(&["config", "user.name", "Test"]).status.success());
+        std::fs::write(dir.path().join("tracked.txt"), "base\n").unwrap();
+        assert!(run(&["add", "tracked.txt"]).status.success());
+        assert!(run(&["commit", "-qm", "base"]).status.success());
+        std::fs::write(dir.path().join("tracked.txt"), "staged\n").unwrap();
+        assert!(run(&["add", "tracked.txt"]).status.success());
+        std::fs::write(dir.path().join("tracked.txt"), "unstaged\n").unwrap();
+        std::fs::write(dir.path().join("new file.txt"), "untracked\n").unwrap();
+        let patch = vcs_patch_bytes(VcsKind::Git, root).unwrap();
+        let patch = String::from_utf8(patch).unwrap();
+        assert!(patch.contains("--- a/tracked.txt"));
+        assert!(patch.contains("new file.txt"));
+        assert!(patch.ends_with('\n'));
     }
 }

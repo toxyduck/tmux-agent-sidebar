@@ -25,6 +25,9 @@ pub fn parse_viewer_command(value: &str) -> Result<Vec<String>, String> {
 }
 
 pub fn open_popup(kind: VcsKind, root: String) -> Result<(), String> {
+    let config = tmux::get_option(DIFF_VIEWER_OPTION)
+        .ok_or_else(|| format!("{DIFF_VIEWER_OPTION} is not configured"))?;
+    parse_viewer_command(&config)?;
     let target = PatchTarget {
         kind: kind.label().to_ascii_lowercase(),
         root,
@@ -66,7 +69,7 @@ pub fn cmd_view_patch() -> i32 {
             return 2;
         }
     };
-    let patch = match git::vcs_patch(kind, &target.root) {
+    let patch = match git::vcs_patch_bytes(kind, &target.root) {
         Ok(patch) => patch,
         Err(error) => {
             eprintln!("Cannot create patch: {error}");
@@ -85,7 +88,7 @@ pub fn cmd_view_patch() -> i32 {
         }
     };
     if let Some(mut stdin) = child.stdin.take()
-        && stdin.write_all(patch.as_bytes()).is_err()
+        && stdin.write_all(&patch).is_err()
     {
         return 1;
     }
@@ -96,7 +99,7 @@ pub fn cmd_view_patch() -> i32 {
 }
 
 fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]
@@ -112,5 +115,9 @@ mod tests {
     #[test]
     fn rejects_shell_string() {
         assert!(parse_viewer_command("hunk patch -").is_err());
+    }
+    #[test]
+    fn quotes_single_quote_for_posix_shell() {
+        assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
     }
 }

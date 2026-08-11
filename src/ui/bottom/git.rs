@@ -57,8 +57,18 @@ pub(super) fn draw_git_content(frame: &mut Frame, state: &mut AppState, inner: R
                 Span::styled(summary, Style::default().fg(theme.text_muted)),
             ]));
         }
-        let visible = inner.height.min(lines.len() as u16);
-        for (index, entry) in state.vcs_entries.iter().take(visible as usize).enumerate() {
+        state.scrolls.git.total_lines = lines.len();
+        state.scrolls.git.visible_height = inner.height as usize;
+        state.scrolls.git.scroll(0);
+        let offset = state.scrolls.git.offset;
+        let visible = inner.height.min(lines.len().saturating_sub(offset) as u16);
+        for (index, entry) in state
+            .vcs_entries
+            .iter()
+            .skip(offset)
+            .take(visible as usize)
+            .enumerate()
+        {
             state
                 .layout
                 .vcs_branch_targets
@@ -68,12 +78,7 @@ pub(super) fn draw_git_content(frame: &mut Frame, state: &mut AppState, inner: R
                     root: entry.root.clone(),
                 });
         }
-        state.scrolls.git.total_lines = lines.len();
-        state.scrolls.git.visible_height = inner.height as usize;
-        frame.render_widget(
-            Paragraph::new(lines).scroll((state.scrolls.git.offset as u16, 0)),
-            inner,
-        );
+        frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), inner);
         return;
     }
 
@@ -308,6 +313,32 @@ mod tests {
             width as usize - display_width(&overlay.text),
         );
         assert_eq!(overlay.y, 1);
+    }
+
+    #[test]
+    fn vcs_rows_snapshot_and_scrolled_click_targets_match_visible_rows() {
+        let mut state = AppState::new(String::new());
+        state.vcs_entries = vec![
+            crate::git::VcsEntry {
+                kind: crate::git::VcsKind::Git,
+                root: "/repo one".into(),
+                branch: "main".into(),
+                diff_stat: Some((2, 1)),
+            },
+            crate::git::VcsEntry {
+                kind: crate::git::VcsKind::Arc,
+                root: "/arc mount".into(),
+                branch: "users/alice/topic".into(),
+                diff_stat: None,
+            },
+        ];
+        draw(&mut state, 40, 1);
+        state.scrolls.git.offset = 1;
+        insta::assert_snapshot!(render(&mut state, 40, 1), @"
+        Arc users/alice/topic  clean
+        ");
+        assert_eq!(state.layout.vcs_branch_targets.len(), 1);
+        assert_eq!(state.layout.vcs_branch_targets[0].root, "/arc mount");
     }
 
     // ─── Branch / PR header rendering ────────────────────────────────

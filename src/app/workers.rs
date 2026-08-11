@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
@@ -14,6 +15,10 @@ use crate::version::{self, UpdateNotice};
 /// drains every tick.
 pub(super) struct Workers {
     pub git_rx: Receiver<GitData>,
+    pub vcs_rx: Receiver<Vec<git::VcsEntry>>,
+    /// Process-lifetime mount history. Agent panes only add paths; this makes
+    /// a just-closed pane still reviewable until the sidebar process exits.
+    pub vcs_paths: Arc<Mutex<BTreeSet<String>>>,
     pub session_rx: Receiver<HashMap<String, String>>,
     pub version_rx: Receiver<UpdateNotice>,
     pub git_tab_active: Arc<AtomicBool>,
@@ -23,14 +28,19 @@ pub(super) struct Workers {
 /// notice fetch) that feed the event loop.
 pub(super) fn spawn(state: &AppState) -> Workers {
     let (git_tx, git_rx) = mpsc::channel::<GitData>();
+    let (vcs_tx, vcs_rx) = mpsc::channel::<Vec<git::VcsEntry>>();
     let (session_tx, session_rx) = mpsc::channel::<HashMap<String, String>>();
     let (version_tx, version_rx) = mpsc::channel::<UpdateNotice>();
     let tmux_pane_clone = state.tmux_pane.clone();
     let git_tab_active = Arc::new(AtomicBool::new(state.bottom_tab == BottomTab::GitStatus));
     let git_tab_flag = Arc::clone(&git_tab_active);
+    let vcs_paths = Arc::new(Mutex::new(BTreeSet::new()));
+    let vcs_paths_worker = Arc::clone(&vcs_paths);
     std::thread::spawn(move || {
         git_poll_loop(&tmux_pane_clone, &git_tx, &git_tab_flag);
     });
+    let vcs_tab_flag = Arc::clone(&git_tab_active);
+    std::thread::spawn(move || vcs_poll_loop(&vcs_tx, &vcs_tab_flag, &vcs_paths_worker));
     std::thread::spawn(move || {
         session_poll_loop(&session_tx);
     });
@@ -42,9 +52,31 @@ pub(super) fn spawn(state: &AppState) -> Workers {
 
     Workers {
         git_rx,
+        vcs_rx,
+        vcs_paths,
         session_rx,
         version_rx,
         git_tab_active,
+    }
+}
+
+fn vcs_poll_loop(
+    tx: &mpsc::Sender<Vec<git::VcsEntry>>,
+    active: &AtomicBool,
+    paths: &Mutex<BTreeSet<String>>,
+) {
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        if !active.load(Ordering::Relaxed) {
+            continue;
+        }
+        let paths = paths
+            .lock()
+            .map(|paths| paths.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if tx.send(git::fetch_vcs_entries(paths)).is_err() {
+            return;
+        }
     }
 }
 

@@ -139,10 +139,10 @@ impl AppState {
     pub fn handle_bottom_tab_click(&mut self, col: u16) {
         // Offset by 1 for the left border character
         let x = col.saturating_sub(1) as usize;
-        // " Activity " = 10 chars (0..10), "│" = 1 char (10), " Git " = 5 chars (11..16)
+        // " Activity " = 10 chars (0..10), "│" = 1 char (10), " Git/Arc " starts at 11.
         if x < 10 {
             self.bottom_tab = BottomTab::Activity;
-        } else if (11..16).contains(&x) {
+        } else if (11..19).contains(&x) {
             self.bottom_tab = BottomTab::GitStatus;
         }
     }

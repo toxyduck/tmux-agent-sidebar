@@ -11,7 +11,6 @@ use crossterm::event::{self};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::SPINNER_PULSE;
-use crate::git;
 use crate::state::BottomTab;
 
 mod input;
@@ -37,6 +36,8 @@ pub fn run(
     let workers = workers::spawn(&state);
     let workers::Workers {
         git_rx,
+        vcs_rx,
+        vcs_paths,
         session_rx,
         version_rx,
         git_tab_active,
@@ -89,14 +90,14 @@ pub fn run(
         if sigusr1 || last_refresh.elapsed() >= refresh_interval {
             let previous_focused_pane_id = state.focus_state.focused_pane_id.clone();
             let is_window_active = state.refresh();
-            if state.bottom_tab == BottomTab::GitStatus {
-                let paths = state
-                    .repo_groups
-                    .iter()
-                    .flat_map(|group| group.panes.iter())
-                    .map(|(pane, _)| pane.path.clone())
-                    .collect::<Vec<_>>();
-                state.apply_vcs_entries(git::fetch_vcs_entries(paths));
+            if let Ok(mut paths) = vcs_paths.lock() {
+                paths.extend(
+                    state
+                        .repo_groups
+                        .iter()
+                        .flat_map(|group| group.panes.iter())
+                        .map(|(pane, _)| pane.path.clone()),
+                );
             }
             if state.focus_state.focused_pane_id != previous_focused_pane_id {
                 render::refresh_git_for_focused_pane(&mut state);
@@ -117,6 +118,10 @@ pub fn run(
 
         if let Ok(data) = git_rx.try_recv() {
             state.apply_git_data(data);
+            needs_redraw = true;
+        }
+        if let Ok(entries) = vcs_rx.try_recv() {
+            state.apply_vcs_entries(entries);
             needs_redraw = true;
         }
 

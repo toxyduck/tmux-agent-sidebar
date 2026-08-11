@@ -106,6 +106,13 @@ impl CapabilityUiState {
         let available: HashSet<(&str, &str)> = reply
             .tree
             .iter()
+            .filter(|node| {
+                !node.fact_ids.is_empty()
+                    || reply.tree.iter().any(|candidate| {
+                        candidate.agent_id == node.agent_id
+                            && candidate.parent_id.as_deref() == Some(node.id.as_str())
+                    })
+            })
             .map(|node| (node.agent_id.as_str(), node.id.as_str()))
             .chain(
                 reply
@@ -120,6 +127,7 @@ impl CapabilityUiState {
                 || expanded.session_id != key.session_id
                 || available.contains(&(expanded.agent_id.as_str(), expanded.node_id.as_str()))
         });
+        self.invalidate_missing_transient_targets(key, reply);
     }
 
     fn prune_dead_scopes(&mut self, live_scopes: &HashSet<PaneScopeKey>) {
@@ -130,6 +138,110 @@ impl CapabilityUiState {
                 session_id: expanded.session_id.clone(),
             })
         });
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|target| !live_scopes.contains(&PaneScopeKey::from_tree_target(target)))
+        {
+            self.selected = None;
+        }
+        if let Some(detail) = &mut self.detail
+            && detail.previous_selection.as_ref().is_some_and(|target| {
+                !live_scopes.contains(&PaneScopeKey::from_tree_target(target))
+            })
+        {
+            detail.previous_selection = None;
+        }
+    }
+
+    fn prune_unconfigured_providers(&mut self, configured_providers: &HashSet<String>) {
+        self.expanded
+            .retain(|expanded| configured_providers.contains(&expanded.provider_id));
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|target| !configured_providers.contains(&target.provider_id))
+        {
+            self.selected = None;
+        }
+        if let Some(detail) = &mut self.detail
+            && detail
+                .previous_selection
+                .as_ref()
+                .is_some_and(|target| !configured_providers.contains(&target.provider_id))
+        {
+            detail.previous_selection = None;
+        }
+    }
+
+    fn invalidate_missing_transient_targets(&mut self, key: &CacheKey, reply: &Reply) {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|target| target.matches_cache_key(key) && !target.exists_in(reply))
+        {
+            self.selected = None;
+        }
+        if let Some(detail) = &mut self.detail
+            && detail
+                .previous_selection
+                .as_ref()
+                .is_some_and(|target| target.matches_cache_key(key) && !target.exists_in(reply))
+        {
+            detail.previous_selection = None;
+        }
+    }
+}
+
+impl PaneScopeKey {
+    fn from_tree_target(target: &TreeTarget) -> Self {
+        Self {
+            provider_id: target.provider_id.clone(),
+            parent_pane_id: target.parent_pane_id.clone(),
+            session_id: target.session_id.clone(),
+        }
+    }
+}
+
+impl TreeTarget {
+    fn matches_cache_key(&self, key: &CacheKey) -> bool {
+        self.provider_id == key.provider
+            && self.parent_pane_id == key.pane_id
+            && self.session_id == key.session_id
+    }
+
+    fn exists_in(&self, reply: &Reply) -> bool {
+        let agent_exists = reply.agents.iter().any(|agent| agent.id == self.agent_id);
+        if !agent_exists {
+            return false;
+        }
+        if self.node_id == "__builtins__" {
+            return reply
+                .builtins
+                .iter()
+                .any(|summary| summary.agent_id == self.agent_id);
+        }
+        if let Some(fact_id) = self.node_id.strip_prefix("fact:") {
+            return reply
+                .facts
+                .iter()
+                .any(|fact| fact.agent_id == self.agent_id && fact.id == fact_id);
+        }
+        if self.node_id.strip_prefix("slot:").is_some() {
+            return reply.slots.contains_key(&self.node_id[5..]);
+        }
+        if self.node_id.starts_with("builtin:") {
+            return reply.builtins.iter().any(|summary| {
+                summary.agent_id == self.agent_id
+                    && summary.items.iter().any(|item| {
+                        self.node_id == format!("builtin:{}:{}", summary.agent_id, item.id)
+                    })
+            });
+        }
+        reply
+            .tree
+            .iter()
+            .any(|node| node.agent_id == self.agent_id && node.id == self.node_id)
     }
 }
 
@@ -392,6 +504,8 @@ impl ExtensionsState {
         self.config_mtime = mtime;
         match extension::load_config(&self.config_path) {
             Ok(config) => {
+                self.ui
+                    .prune_unconfigured_providers(&config.providers.keys().cloned().collect());
                 self.config = Some(config);
                 self.config_error = None;
                 self.cache.clear();
@@ -485,6 +599,34 @@ fn worker_loop(rx: Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerResult>) {
 mod tests {
     use super::*;
 
+    fn test_extensions_state(
+        config_path: PathBuf,
+    ) -> (ExtensionsState, mpsc::Sender<WorkerResult>) {
+        let (inspect_tx, _inspect_rx) = mpsc::sync_channel(1);
+        let (control_tx, _control_rx) = mpsc::sync_channel(1);
+        let (result_tx, rx) = mpsc::channel();
+        (
+            ExtensionsState {
+                config: None,
+                config_error: None,
+                config_path,
+                config_mtime: None,
+                cache: HashMap::new(),
+                in_flight: HashSet::new(),
+                inspect_tx,
+                control_tx,
+                rx,
+                last_refresh: Instant::now(),
+                ui: CapabilityUiState::default(),
+            },
+            result_tx,
+        )
+    }
+
+    fn config_for(provider: &str) -> String {
+        format!(r#"{{"version":1,"providers":{{"{provider}":{{"argv":["/bin/true"]}}}}}}"#)
+    }
+
     fn disclosure_target(
         provider_id: &str,
         pane_id: &str,
@@ -561,6 +703,20 @@ mod tests {
     }
 
     #[test]
+    fn none_session_scope_survives_live_snapshot_pruning() {
+        let target = disclosure_target("claude", "%1", None, "main", "skills");
+        let mut ui = CapabilityUiState::default();
+        ui.toggle(&target);
+        ui.prune_dead_scopes(&HashSet::from([PaneScopeKey {
+            provider_id: "claude".into(),
+            parent_pane_id: "%1".into(),
+            session_id: None,
+        }]));
+
+        assert!(ui.is_expanded(&target));
+    }
+
+    #[test]
     fn successful_inspect_prunes_only_missing_nodes_in_its_exact_scope() {
         let retained = disclosure_target("claude", "%1", Some("one"), "main", "skills");
         let removed = disclosure_target("claude", "%1", Some("one"), "main", "tools");
@@ -578,7 +734,7 @@ mod tests {
                     agent_id: "main".into(),
                     parent_id: None,
                     label: "Skills".into(),
-                    fact_ids: vec![],
+                    fact_ids: vec!["skill".into()],
                     detail_token: None,
                     category: "skills".into(),
                 }],
@@ -589,5 +745,131 @@ mod tests {
         assert!(ui.is_expanded(&retained));
         assert!(!ui.is_expanded(&removed));
         assert!(ui.is_expanded(&other_pane));
+    }
+
+    #[test]
+    fn disclosure_becoming_a_leaf_is_pruned() {
+        let target = disclosure_target("claude", "%1", None, "main", "skills");
+        let mut ui = CapabilityUiState::default();
+        ui.toggle(&target);
+        ui.reconcile_scope(
+            &CacheKey::new("claude", "%1", None),
+            &Reply {
+                version: 1,
+                tree: vec![crate::extension::TreeNode {
+                    id: "skills".into(),
+                    agent_id: "main".into(),
+                    parent_id: None,
+                    label: "Skills".into(),
+                    fact_ids: vec![],
+                    detail_token: None,
+                    category: "skills".into(),
+                }],
+                ..Reply::default()
+            },
+        );
+
+        assert!(!ui.is_expanded(&target));
+    }
+
+    #[test]
+    fn successful_inspect_invalidates_missing_selection_and_detail_restore_target() {
+        let missing = disclosure_target("claude", "%1", Some("one"), "main", "skills");
+        let mut ui = CapabilityUiState {
+            selected: Some(missing.clone()),
+            detail: Some(DetailView {
+                title: "Skill".into(),
+                source: String::new(),
+                text: String::new(),
+                scroll: 0,
+                previous_selection: Some(missing),
+                previous_pane_scroll: 0,
+            }),
+            ..CapabilityUiState::default()
+        };
+        ui.reconcile_scope(
+            &CacheKey::new("claude", "%1", Some("one")),
+            &Reply {
+                version: 1,
+                agents: vec![crate::extension::AgentNode {
+                    id: "main".into(),
+                    parent_id: None,
+                    label: "Ada".into(),
+                    role: crate::extension::AgentRole::Main,
+                    model: None,
+                }],
+                ..Reply::default()
+            },
+        );
+
+        assert!(ui.selected.is_none());
+        assert!(ui.detail.unwrap().previous_selection.is_none());
+    }
+
+    #[test]
+    fn inspect_error_keeps_stale_scope_disclosure_and_selection() {
+        let (mut state, result_tx) = test_extensions_state(PathBuf::new());
+        let target = disclosure_target("claude", "%1", None, "main", "skills");
+        let key = CacheKey::new("claude", "%1", None);
+        state.ui.toggle(&target);
+        state.cache.insert(
+            key.clone(),
+            Inspection {
+                reply: Reply {
+                    version: 1,
+                    ..Reply::default()
+                },
+                stale: false,
+            },
+        );
+        result_tx
+            .send(WorkerResult::Inspect {
+                key: key.clone(),
+                result: Err("collector unavailable".into()),
+            })
+            .unwrap();
+
+        state.take_results();
+        assert!(state.cache.get(&key).unwrap().stale);
+        assert!(state.ui.is_expanded(&target));
+        assert_eq!(state.ui.selected, Some(target));
+    }
+
+    #[test]
+    fn successful_config_provider_removal_prunes_only_removed_provider_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extensions.json");
+        let (mut state, _result_tx) = test_extensions_state(path.clone());
+        let claude = disclosure_target("claude", "%1", None, "main", "skills");
+        let codex = disclosure_target("codex", "%1", None, "main", "skills");
+        state.ui.toggle(&claude);
+        state.ui.toggle(&codex);
+
+        std::fs::write(&path, config_for("claude")).unwrap();
+        state.reload_config(true);
+        assert!(state.ui.is_expanded(&claude));
+        assert!(!state.ui.is_expanded(&codex));
+
+        std::fs::write(&path, config_for("codex")).unwrap();
+        state.reload_config(true);
+        assert!(!state.ui.is_expanded(&claude));
+    }
+
+    #[test]
+    fn unchanged_or_invalid_config_preserves_existing_scope_disclosure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extensions.json");
+        let (mut state, _result_tx) = test_extensions_state(path.clone());
+        let target = disclosure_target("claude", "%1", None, "main", "skills");
+
+        std::fs::write(&path, config_for("claude")).unwrap();
+        state.reload_config(true);
+        state.ui.toggle(&target);
+        state.reload_config(false);
+        assert!(state.ui.is_expanded(&target));
+
+        std::fs::write(&path, "not json").unwrap();
+        state.reload_config(true);
+        assert!(state.ui.is_expanded(&target));
     }
 }

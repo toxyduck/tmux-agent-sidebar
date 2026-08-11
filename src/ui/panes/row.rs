@@ -51,7 +51,15 @@ pub(super) fn render_extension_tree(
         .find(|agent| agent.parent_id.is_none())
         .map(|agent| agent.id.clone())
         .unwrap_or_else(|| pane_id.to_string());
-    let selected_agent_id = selected_agent_id.unwrap_or(&default_agent_id);
+    let selected_agent_id = selected_agent_id
+        .filter(|agent_id| {
+            inspection
+                .reply
+                .agents
+                .iter()
+                .any(|agent| agent.id == *agent_id)
+        })
+        .unwrap_or(&default_agent_id);
     let mut facts: Vec<_> = inspection
         .reply
         .facts

@@ -301,6 +301,8 @@ impl AppState {
                     .as_ref()
                     .is_some_and(|subagent| {
                         subagent.parent_pane_id == tree.parent_pane_id
+                            && subagent.provider_id == tree.provider_id
+                            && subagent.session_id == tree.session_id
                             && subagent.agent_id == tree.agent_id
                     })
                 {

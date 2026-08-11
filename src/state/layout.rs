@@ -12,6 +12,7 @@ pub struct RowTarget {
 pub struct SubagentTarget {
     pub parent_pane_id: String,
     pub provider_id: String,
+    pub session_id: Option<String>,
     pub agent_id: String,
     pub node_id: String,
 }
@@ -303,6 +304,8 @@ impl AppState {
                 .as_ref()
                 .is_some_and(|subagent| {
                     subagent.parent_pane_id == target.parent_pane_id
+                        && subagent.provider_id == target.provider_id
+                        && subagent.session_id == target.session_id
                         && subagent.agent_id == target.agent_id
                 })
             {

@@ -5,7 +5,7 @@ use ratatui::{
 
 use super::SPAWN_BUTTON;
 use super::row;
-use crate::state::{AppState, Focus, TreeTarget};
+use crate::state::{AppState, Focus, SubagentTarget, TreeTarget};
 use crate::ui::text::display_width;
 
 #[derive(Debug, Default)]
@@ -14,12 +14,41 @@ pub(super) struct CollectedRows {
     pub line_to_row: Vec<Option<usize>>,
     pub pending_spawn: Vec<(usize, String, String)>,
     pub pending_remove: Vec<(usize, u16, String)>,
-    pub pending_subagents: Vec<(usize, String, String, String, String)>,
+    pub pending_subagents: Vec<(usize, String, String, Option<String>, String, String)>,
     pub pending_tree: Vec<(usize, TreeTarget)>,
 }
 
 fn agent_label(agent: &crate::extension::AgentNode) -> &str {
     &agent.label
+}
+
+fn scoped_selected_agent_id(
+    pane_id: &str,
+    provider_id: &str,
+    session_id: Option<&str>,
+    agents: &[crate::extension::AgentNode],
+    subagent: Option<&SubagentTarget>,
+    tree: Option<&TreeTarget>,
+) -> Option<String> {
+    let candidate = subagent
+        .filter(|target| {
+            target.parent_pane_id == pane_id
+                && target.provider_id == provider_id
+                && target.session_id.as_deref() == session_id
+        })
+        .map(|target| target.agent_id.as_str())
+        .or_else(|| {
+            tree.filter(|target| {
+                target.parent_pane_id == pane_id
+                    && target.provider_id == provider_id
+                    && target.session_id.as_deref() == session_id
+            })
+            .map(|target| target.agent_id.as_str())
+        })?;
+    agents
+        .iter()
+        .any(|agent| agent.id == candidate)
+        .then(|| candidate.to_string())
 }
 
 pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
@@ -149,6 +178,7 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                                 line,
                                 pane.pane_id.clone(),
                                 pane.agent.as_str().to_string(),
+                                pane.session_id.clone(),
                                 agent.id.clone(),
                                 agent.id.clone(),
                             ));
@@ -159,30 +189,28 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                 // parent AgentNode. Their click identity uses TreeNode.id, never
                 // a duplicate label or current line offset.
                 let tree_start = collected.lines.len() + pane_lines.len();
-                for (offset, (line, target)) in row::render_extension_tree(
-                    state.extensions.inspection(
+                let inspection = state.extensions.inspection(
+                    &pane.pane_id,
+                    pane.agent.as_str(),
+                    pane.session_id.as_deref(),
+                );
+                let selected_agent_id = inspection.and_then(|inspection| {
+                    scoped_selected_agent_id(
                         &pane.pane_id,
                         pane.agent.as_str(),
                         pane.session_id.as_deref(),
-                    ),
+                        &inspection.reply.agents,
+                        state.selected_subagent_target.as_ref(),
+                        state.extensions.ui.selected.as_ref(),
+                    )
+                });
+                for (offset, (line, target)) in row::render_extension_tree(
+                    inspection,
                     state.extensions.config.as_ref(),
                     &pane.pane_id,
                     pane.agent.as_str(),
                     pane.session_id.as_deref(),
-                    state
-                        .selected_subagent_target
-                        .as_ref()
-                        .filter(|target| target.parent_pane_id == pane.pane_id)
-                        .map(|target| target.agent_id.as_str())
-                        .or_else(|| {
-                            state
-                                .extensions
-                                .ui
-                                .selected
-                                .as_ref()
-                                .filter(|target| target.parent_pane_id == pane.pane_id)
-                                .map(|target| target.agent_id.as_str())
-                        }),
+                    selected_agent_id.as_deref(),
                     &state.extensions.ui,
                     width,
                     theme,
@@ -289,6 +317,96 @@ mod tests {
         assert_eq!(agent_label(&main), "Ada");
         assert_eq!(agent_label(&subagent), "Ada");
         assert_eq!(agent_label(&unknown), "Ada");
+    }
+
+    #[test]
+    fn selected_agent_requires_matching_provider_session_and_known_agent() {
+        let agents = vec![
+            AgentNode {
+                id: "main".into(),
+                parent_id: None,
+                label: "Main".into(),
+                role: AgentRole::Main,
+                model: None,
+            },
+            AgentNode {
+                id: "child".into(),
+                parent_id: Some("main".into()),
+                label: "Child".into(),
+                role: AgentRole::Subagent,
+                model: None,
+            },
+        ];
+        let subagent = SubagentTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            session_id: Some("session".into()),
+            agent_id: "child".into(),
+            node_id: "child".into(),
+        };
+        let tree = TreeTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            session_id: Some("session".into()),
+            agent_id: "child".into(),
+            node_id: "skills".into(),
+            detail_token: None,
+            inline_detail: None,
+            is_disclosure: true,
+        };
+
+        assert_eq!(
+            scoped_selected_agent_id(
+                "%1",
+                "claude",
+                Some("session"),
+                &agents,
+                Some(&subagent),
+                None,
+            ),
+            Some("child".into())
+        );
+        assert!(
+            scoped_selected_agent_id(
+                "%1",
+                "codex",
+                Some("session"),
+                &agents,
+                Some(&subagent),
+                None,
+            )
+            .is_none()
+        );
+        assert!(
+            scoped_selected_agent_id(
+                "%1",
+                "claude",
+                Some("other"),
+                &agents,
+                Some(&subagent),
+                None,
+            )
+            .is_none()
+        );
+        let unknown = SubagentTarget {
+            agent_id: "missing".into(),
+            ..subagent
+        };
+        assert!(
+            scoped_selected_agent_id(
+                "%1",
+                "claude",
+                Some("session"),
+                &agents,
+                Some(&unknown),
+                None,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            scoped_selected_agent_id("%1", "claude", Some("session"), &agents, None, Some(&tree),),
+            Some("child".into())
+        );
     }
 
     #[test]

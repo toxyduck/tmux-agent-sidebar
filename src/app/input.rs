@@ -355,6 +355,7 @@ mod tests {
         let subagent = SubagentTarget {
             parent_pane_id: "%1".into(),
             provider_id: "claude".into(),
+            session_id: None,
             agent_id: "child".into(),
             node_id: "child".into(),
         };

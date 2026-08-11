@@ -575,17 +575,20 @@ pub fn draw_agents(frame: &mut Frame, state: &mut AppState, area: Rect) {
     state.layout.line_to_row = line_to_row;
     state.layout.subagent_line_targets = pending_subagents
         .into_iter()
-        .map(|(line, parent_pane_id, provider_id, agent_id, node_id)| {
-            (
-                line,
-                crate::state::SubagentTarget {
-                    parent_pane_id,
-                    provider_id,
-                    agent_id,
-                    node_id,
-                },
-            )
-        })
+        .map(
+            |(line, parent_pane_id, provider_id, session_id, agent_id, node_id)| {
+                (
+                    line,
+                    crate::state::SubagentTarget {
+                        parent_pane_id,
+                        provider_id,
+                        session_id,
+                        agent_id,
+                        node_id,
+                    },
+                )
+            },
+        )
         .collect();
     state.layout.tree_line_targets = pending_tree.into_iter().collect();
     let mut seen_panes = std::collections::HashSet::new();

@@ -24,6 +24,7 @@ struct PaneTaskUpdate {
     dismissed_total: Option<usize>,
     inactive_since: Option<u64>,
     log_mtime: Option<std::time::SystemTime>,
+    log_len: Option<u64>,
 }
 
 pub(crate) fn classify_task_progress(
@@ -73,6 +74,17 @@ impl AppState {
             })
             .collect();
         self.repo_groups = crate::group::group_panes_by_repo(&sessions);
+        self.extensions
+            .refresh(self.repo_groups.iter().flat_map(|group| {
+                group.panes.iter().map(|(pane, _)| {
+                    (
+                        pane.pane_id.clone(),
+                        pane.agent.as_str().to_string(),
+                        pane.session_id.clone(),
+                        canonical_pane_cwd(&pane.path),
+                    )
+                })
+            }));
         if !self.sessions.dirty
             && self
                 .repo_groups
@@ -146,6 +158,7 @@ impl AppState {
     /// Returns whether the sidebar's window is the active tmux window.
     pub fn refresh(&mut self) -> bool {
         self.refresh_now();
+        self.apply_extension_results();
         let (focused, window_active, _, _) = tmux::get_sidebar_pane_info(&self.tmux_pane);
         let (mut sessions, mut process_snapshot) = tmux::query_sessions_with_process_snapshot();
         self.sweep_dead_bg_shells_if_due(&mut sessions, &mut process_snapshot);
@@ -239,6 +252,9 @@ impl AppState {
             for (pane, _) in &group.panes {
                 let prior_state = self.pane_state(&pane.pane_id).cloned().unwrap_or_default();
                 let current_mtime = activity::log_mtime(&pane.pane_id);
+                let current_len = std::fs::metadata(activity::log_file_path(&pane.pane_id))
+                    .ok()
+                    .map(|metadata| metadata.len());
                 // Skip the (full-file) re-parse when the activity log
                 // hasn't been touched since the last tick AND the pane
                 // is still active. We must still re-evaluate the
@@ -246,8 +262,9 @@ impl AppState {
                 // long-stalled progress bar gets dismissed even if the
                 // log file itself stops changing.
                 let agent_active = pane.status.is_active();
-                let log_unchanged =
-                    current_mtime.is_some() && current_mtime == prior_state.task_progress_log_mtime;
+                let log_unchanged = current_mtime.is_some()
+                    && current_mtime == prior_state.task_progress_log_mtime
+                    && current_len == prior_state.task_progress_log_len;
                 if log_unchanged && agent_active {
                     // Just refresh the mtime bookkeeping so we don't
                     // accidentally drop the cache on a future iteration
@@ -260,6 +277,7 @@ impl AppState {
                         dismissed_total: prior_state.task_dismissed_total,
                         inactive_since: None,
                         log_mtime: current_mtime,
+                        log_len: current_len,
                     });
                     continue;
                 }
@@ -313,6 +331,7 @@ impl AppState {
                     dismissed_total: next_dismissed_total,
                     inactive_since: next_inactive_since,
                     log_mtime: current_mtime,
+                    log_len: current_len,
                 });
             }
         }
@@ -322,6 +341,7 @@ impl AppState {
             pane_state.task_dismissed_total = update.dismissed_total;
             pane_state.task_progress = update.progress;
             pane_state.task_progress_log_mtime = update.log_mtime;
+            pane_state.task_progress_log_len = update.log_len;
         }
     }
 
@@ -366,6 +386,17 @@ impl AppState {
         self.activity.entries = entries;
         self.activity.log_cache = current_mtime.map(|m| (pane_id.clone(), m));
     }
+}
+
+/// `PaneInfo.path` comes from tmux's pane-current-path query. Keep the
+/// collector request scoped to that pane; never substitute this process PWD.
+fn canonical_pane_cwd(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    std::fs::canonicalize(path)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 pub(crate) fn sweep_dead_bg_shells(
@@ -935,5 +966,14 @@ mod tests {
             state.repo_groups[0].panes[0].0.session_name.is_empty(),
             "pane without session_id must end up with an empty session_name"
         );
+    }
+
+    #[test]
+    fn canonical_pane_cwd_uses_the_reported_pane_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let reported = dir.path().join(".");
+        let cwd = canonical_pane_cwd(reported.to_str().unwrap()).unwrap();
+        assert_eq!(cwd, dir.path().to_string_lossy());
+        assert_ne!(cwd, std::env::current_dir().unwrap().to_string_lossy());
     }
 }

@@ -10,6 +10,14 @@
   <a href="https://hiroppy.github.io/tmux-agent-sidebar/features/agent-pane/">Features</a>
 </p>
 
+## Capability collectors (fork extension)
+
+Set `@sidebar_extensions_config` to a protocol-v1 JSON file. Each provider has
+an `argv` array, never a shell command. The sidebar sends `inspect` and
+`activate` requests on stdin. `activate` always focuses the original pane;
+the collector must open the provider's native child viewer or return an error.
+No collector may create a pane, resume a session, or start a second TUI.
+
 ## Features
 
 - **Every pane, one view** 

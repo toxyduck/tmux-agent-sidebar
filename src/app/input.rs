@@ -61,6 +61,15 @@ pub(super) fn handle_key_event(
     state: &mut AppState,
     git_tab_active: &AtomicBool,
 ) -> bool {
+    if state.extensions.ui.detail.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => state.close_capability_detail(),
+            KeyCode::Char('j') | KeyCode::Down => state.scroll_detail(1),
+            KeyCode::Char('k') | KeyCode::Up => state.scroll_detail(-1),
+            _ => {}
+        }
+        return true;
+    }
     if state.is_notices_popup_open() {
         if key.code == KeyCode::Esc {
             state.close_notices_popup();
@@ -149,7 +158,28 @@ pub(super) fn handle_key_event(
         }
         KeyCode::Enter => {
             if state.focus_state.focus == Focus::Panes {
-                state.activate_selected_pane();
+                if state
+                    .extensions
+                    .ui
+                    .selected
+                    .as_ref()
+                    .and_then(|target| target.detail_token.as_ref())
+                    .is_some()
+                {
+                    state.open_selected_capability_detail();
+                } else if let Some(target) = state.selected_subagent_target.clone() {
+                    state.activate_subagent(target);
+                } else {
+                    state.activate_selected_pane();
+                }
+            }
+        }
+        KeyCode::Char(' ') => {
+            if state.focus_state.focus == Focus::Panes
+                && let Some(target) = state.extensions.ui.selected.clone()
+                && target.is_disclosure
+            {
+                state.extensions.ui.toggle(&target);
             }
         }
         KeyCode::Tab => {
@@ -354,5 +384,53 @@ mod tests {
         // Below 0 the popup nav helper is a no-op.
         handle_key_event(ctrl_key('p'), &mut state, &flag);
         assert_eq!(state.repo_popup_selected(), 0);
+    }
+
+    #[test]
+    fn detail_view_scrolls_and_esc_restores_tree_selection() {
+        let mut state = state_with_three_panes();
+        let target = crate::state::TreeTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            agent_id: "agent-1".into(),
+            node_id: "skill:review".into(),
+            detail_token: Some("detail-token".into()),
+            is_disclosure: false,
+        };
+        state.scrolls.panes.offset = 4;
+        state.extensions.ui.detail = Some(crate::state::DetailView {
+            title: "Skill".into(),
+            source: "/repo/skill.md".into(),
+            text: "line".into(),
+            scroll: 0,
+            previous_selection: Some(target.clone()),
+            previous_pane_scroll: 4,
+        });
+        let flag = AtomicBool::new(false);
+
+        handle_key_event(key(KeyCode::Char('j')), &mut state, &flag);
+        assert_eq!(state.extensions.ui.detail.as_ref().unwrap().scroll, 1);
+        handle_key_event(key(KeyCode::Esc), &mut state, &flag);
+        assert!(state.extensions.ui.detail.is_none());
+        assert_eq!(state.extensions.ui.selected, Some(target));
+        assert_eq!(state.scrolls.panes.offset, 4);
+    }
+
+    #[test]
+    fn space_toggles_selected_disclosure_by_stable_node_id() {
+        let mut state = state_with_three_panes();
+        let target = crate::state::TreeTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "codex".into(),
+            agent_id: "agent-1".into(),
+            node_id: "skills".into(),
+            detail_token: None,
+            is_disclosure: true,
+        };
+        state.extensions.ui.selected = Some(target.clone());
+        let flag = AtomicBool::new(false);
+        handle_key_event(key(KeyCode::Char(' ')), &mut state, &flag);
+        assert!(state.extensions.ui.is_expanded("%1", "skills"));
+        assert_eq!(state.extensions.ui.selected, Some(target));
     }
 }

@@ -57,6 +57,11 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     state.layout.hyperlink_overlays.clear();
     let area = frame.area();
 
+    if state.extensions.ui.detail.is_some() {
+        panes::draw_detail(frame, state, area);
+        return;
+    }
+
     let bot_h = state.bottom_panel_height;
     let divider_h = if bot_h > 0 && state.pet_enabled {
         PET_SCENE_HEIGHT

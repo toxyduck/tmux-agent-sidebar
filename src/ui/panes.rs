@@ -9,7 +9,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 
 use crate::state::{AppState, Focus, PopupState, RepoFilter, SpawnField};
@@ -493,8 +493,25 @@ pub fn draw_agents(frame: &mut Frame, state: &mut AppState, area: Rect) {
         line_to_row,
         pending_spawn,
         pending_remove,
+        pending_subagents,
+        pending_tree,
     } = row_collector::collect(state, layout.list_area.width);
     state.layout.line_to_row = line_to_row;
+    state.layout.subagent_line_targets = pending_subagents
+        .into_iter()
+        .map(|(line, parent_pane_id, provider_id, agent_id, node_id)| {
+            (
+                line,
+                crate::state::SubagentTarget {
+                    parent_pane_id,
+                    provider_id,
+                    agent_id,
+                    node_id,
+                },
+            )
+        })
+        .collect();
+    state.layout.tree_line_targets = pending_tree.into_iter().collect();
     let scroll_offset = compute_scroll_offset(state, lines.len(), layout.list_area);
     click_targets::materialize(
         state,
@@ -507,6 +524,61 @@ pub fn draw_agents(frame: &mut Frame, state: &mut AppState, area: Rect) {
 
     render_flash_banner_into(frame, state, area);
     popups::render_if_open(frame, state, area);
+}
+
+/// Inline capability details intentionally take over the complete sidebar.
+/// This keeps source text in context without creating a popup or tmux pane.
+pub fn draw_detail(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let Some(detail) = state.extensions.ui.detail.as_ref() else {
+        return;
+    };
+    let theme = &state.theme;
+    let title = truncate_to_width(
+        &format!(" {} ", detail.title),
+        area.width.saturating_sub(2) as usize,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let source = if detail.source.is_empty() {
+        "Source: unavailable".to_string()
+    } else {
+        format!("Source: {}", detail.source)
+    };
+    let source = truncate_to_width(&source, inner.width as usize);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            source,
+            Style::default().fg(theme.text_muted),
+        ))),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    let text_area = Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    frame.render_widget(
+        Paragraph::new(detail.text.clone())
+            .style(Style::default().fg(theme.text_active))
+            .wrap(Wrap { trim: false })
+            .scroll((detail.scroll.min(u16::MAX as usize) as u16, 0)),
+        text_area,
+    );
 }
 
 #[cfg(test)]

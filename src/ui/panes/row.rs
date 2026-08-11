@@ -1,8 +1,14 @@
-use ratatui::{style::Style, text::Line};
+use ratatui::{
+    style::Style,
+    text::{Line, Span},
+};
+use std::collections::{HashMap, HashSet};
 
+use crate::state::{CapabilityUiState, TreeTarget};
 use crate::tmux::PaneStatus;
 use crate::ui::colors::ColorTheme;
 use crate::ui::icons::StatusIcons;
+use crate::ui::text::{display_width, truncate_to_width};
 
 mod body;
 mod branch;
@@ -20,6 +26,272 @@ use status::running_icon_for;
 use status::status_row;
 
 pub(super) use branch::sidebar_remove_marker_col;
+
+/// Render collector facts below an agent row. Facts are data, not UI code:
+/// configuration may hide/reorder them and built-ins collapse to one muted row.
+pub(super) fn render_extension_tree(
+    inspection: Option<&crate::extension::Inspection>,
+    config: Option<&crate::extension::ExtensionsConfig>,
+    pane_id: &str,
+    provider_id: &str,
+    ui: &CapabilityUiState,
+    width: usize,
+    theme: &ColorTheme,
+) -> Vec<(Line<'static>, TreeTarget)> {
+    let (Some(inspection), Some(config)) = (inspection, config) else {
+        return Vec::new();
+    };
+    let mut facts = inspection.reply.facts.clone();
+    facts.retain(|fact| !config.hidden_rows.iter().any(|hidden| hidden == &fact.id));
+    facts.sort_by_key(|fact| {
+        config
+            .row_order
+            .iter()
+            .position(|id| id == &fact.id)
+            .unwrap_or(usize::MAX)
+    });
+    let ctx = RowCtx {
+        marker_char: " ",
+        marker_style: Style::default(),
+        inner_width: width.saturating_sub(2),
+        theme,
+        bg: None,
+        active: false,
+    };
+    let facts_by_id: HashMap<_, _> = facts.iter().map(|fact| (fact.id.as_str(), fact)).collect();
+    let tree_by_id: HashMap<_, _> = inspection
+        .reply
+        .tree
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
+    let mut referenced_facts = HashSet::new();
+    let default_agent_id = inspection
+        .reply
+        .agents
+        .iter()
+        .find(|agent| agent.parent_id.is_none())
+        .map(|agent| agent.id.clone())
+        .unwrap_or_else(|| pane_id.to_string());
+    let mut lines = Vec::new();
+    let fact_line = |fact: &crate::extension::Fact, indent: usize| {
+        let marker = match fact.evidence {
+            crate::extension::Evidence::Observed => "●",
+            crate::extension::Evidence::Available => "○",
+            crate::extension::Evidence::Inferred => "~",
+            crate::extension::Evidence::Error => "×",
+            crate::extension::Evidence::Unknown => "?",
+        };
+        let text = truncate_to_width(
+            &format!("  {}{marker} {}", "  ".repeat(indent), fact.label),
+            ctx.inner_width,
+        );
+        let width = display_width(&text);
+        let line = ctx.row_line(
+            vec![Span::styled(text, Style::default().fg(theme.text_muted))],
+            width,
+        );
+        let target = TreeTarget {
+            parent_pane_id: pane_id.to_string(),
+            provider_id: provider_id.to_string(),
+            agent_id: default_agent_id.clone(),
+            node_id: format!("fact:{}", fact.id),
+            detail_token: fact.detail_token.clone(),
+            is_disclosure: false,
+        };
+        (line, target)
+    };
+
+    // A root TreeNode is visible by default. Descendants require an explicit
+    // disclosure state, so a dense collector cannot flood the sidebar.
+    for node in &inspection.reply.tree {
+        let mut ancestors = Vec::new();
+        let mut parent = node.parent_id.as_deref();
+        let mut seen = HashSet::new();
+        while let Some(parent_id) = parent {
+            if !seen.insert(parent_id) {
+                break;
+            }
+            let Some(parent_node) = tree_by_id.get(parent_id) else {
+                break;
+            };
+            ancestors.push(parent_node.id.as_str());
+            parent = parent_node.parent_id.as_deref();
+        }
+        if ancestors
+            .iter()
+            .any(|ancestor| !ui.is_expanded(pane_id, ancestor))
+        {
+            continue;
+        }
+        let has_children = inspection
+            .reply
+            .tree
+            .iter()
+            .any(|candidate| candidate.parent_id.as_deref() == Some(node.id.as_str()));
+        let has_content = has_children || !node.fact_ids.is_empty();
+        let expanded = ui.is_expanded(pane_id, &node.id);
+        let disclosure = if has_content {
+            if expanded { "▼" } else { "▶" }
+        } else {
+            "•"
+        };
+        let text = truncate_to_width(
+            &format!(
+                "  {}{disclosure} {}",
+                "  ".repeat(ancestors.len()),
+                node.label
+            ),
+            ctx.inner_width,
+        );
+        let width = display_width(&text);
+        lines.push((
+            ctx.row_line(
+                vec![Span::styled(text, Style::default().fg(theme.text_muted))],
+                width,
+            ),
+            TreeTarget {
+                parent_pane_id: pane_id.to_string(),
+                provider_id: provider_id.to_string(),
+                agent_id: default_agent_id.clone(),
+                node_id: node.id.clone(),
+                detail_token: node.detail_token.clone(),
+                is_disclosure: has_content,
+            },
+        ));
+        if expanded {
+            for fact_id in &node.fact_ids {
+                if let Some(fact) = facts_by_id.get(fact_id.as_str()) {
+                    referenced_facts.insert(fact.id.as_str());
+                    lines.push(fact_line(fact, ancestors.len() + 1));
+                }
+            }
+        }
+    }
+    for fact in &facts {
+        if !referenced_facts.contains(fact.id.as_str()) {
+            lines.push(fact_line(fact, 0));
+        }
+    }
+    let builtins: Vec<_> = inspection
+        .reply
+        .builtins
+        .iter()
+        .filter(|fact| !config.hidden_rows.iter().any(|hidden| hidden == &fact.id))
+        .collect();
+    if !builtins.is_empty() && !config.hidden_rows.iter().any(|hidden| hidden == "builtins") {
+        let builtins_id = "__builtins__";
+        let expanded = ui.is_expanded(pane_id, builtins_id);
+        let exceptions = builtins
+            .iter()
+            .filter(|fact| !matches!(fact.evidence, crate::extension::Evidence::Available))
+            .count();
+        let exception_text = if exceptions == 0 {
+            String::new()
+        } else {
+            format!(
+                " ({exceptions} exception{})",
+                if exceptions == 1 { "" } else { "s" }
+            )
+        };
+        let text = truncate_to_width(
+            &format!(
+                "  {} Built-ins: {}{}",
+                if expanded { "▼" } else { "▶" },
+                builtins.len(),
+                exception_text
+            ),
+            ctx.inner_width,
+        );
+        let width = display_width(&text);
+        lines.push((
+            ctx.row_line(
+                vec![Span::styled(text, Style::default().fg(theme.text_inactive))],
+                width,
+            ),
+            TreeTarget {
+                parent_pane_id: pane_id.to_string(),
+                provider_id: provider_id.to_string(),
+                agent_id: default_agent_id.clone(),
+                node_id: builtins_id.to_string(),
+                detail_token: None,
+                is_disclosure: true,
+            },
+        ));
+        if expanded {
+            for fact in builtins {
+                lines.push(fact_line(fact, 1));
+            }
+        }
+    }
+    let mut slots: Vec<_> = config
+        .slots
+        .iter()
+        .filter(|slot| !config.hidden_rows.iter().any(|hidden| hidden == &slot.id))
+        .collect();
+    slots.sort_by_key(|slot| {
+        config
+            .row_order
+            .iter()
+            .position(|id| id == &slot.id)
+            .unwrap_or(usize::MAX)
+    });
+    for slot in slots {
+        if let Some(value) = inspection.reply.slots.get(&slot.id) {
+            let text = truncate_to_width(&format!("  {}: {value}", slot.title), ctx.inner_width);
+            let width = display_width(&text);
+            lines.push((
+                ctx.row_line(
+                    vec![Span::styled(text, Style::default().fg(theme.text_muted))],
+                    width,
+                ),
+                TreeTarget {
+                    parent_pane_id: pane_id.to_string(),
+                    provider_id: provider_id.to_string(),
+                    agent_id: default_agent_id.clone(),
+                    node_id: format!("slot:{}", slot.id),
+                    detail_token: None,
+                    is_disclosure: false,
+                },
+            ));
+        }
+    }
+    if inspection.stale {
+        let text = "  ~ collector data stale";
+        lines.push((
+            ctx.row_line(
+                vec![Span::styled(text, Style::default().fg(theme.text_inactive))],
+                display_width(text),
+            ),
+            TreeTarget {
+                parent_pane_id: pane_id.to_string(),
+                provider_id: provider_id.to_string(),
+                agent_id: default_agent_id.clone(),
+                node_id: "__stale__".into(),
+                detail_token: None,
+                is_disclosure: false,
+            },
+        ));
+    } else if let Some(error) = &inspection.reply.error {
+        let text = truncate_to_width(&format!("  × {error}"), ctx.inner_width);
+        let width = display_width(&text);
+        lines.push((
+            ctx.row_line(
+                vec![Span::styled(text, Style::default().fg(theme.status_error))],
+                width,
+            ),
+            TreeTarget {
+                parent_pane_id: pane_id.to_string(),
+                provider_id: provider_id.to_string(),
+                agent_id: default_agent_id,
+                node_id: "__error__".into(),
+                detail_token: None,
+                is_disclosure: false,
+            },
+        ));
+    }
+    lines
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_pane_lines_with_ports(
@@ -98,7 +370,9 @@ pub(super) fn render_pane_lines_with_ports(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extension::{Evidence, ExtensionsConfig, Fact, Inspection, Reply, TreeNode};
     use crate::group::PaneGitInfo;
+    use crate::state::CapabilityUiState;
     use crate::tmux::{AgentType, PaneInfo, PermissionMode, WorktreeMetadata};
     use crate::ui::icons::StatusIcons;
     use crate::ui::text::display_width;
@@ -142,6 +416,95 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn extension_tree_uses_stable_ids_for_duplicate_labels_and_collapses_builtins() {
+        let inspection = Inspection {
+            stale: false,
+            reply: Reply {
+                version: 1,
+                facts: vec![
+                    Fact {
+                        id: "skill-a".into(),
+                        label: "review".into(),
+                        detail: String::new(),
+                        evidence: Evidence::Available,
+                        source: String::new(),
+                        detail_token: Some("token-a".into()),
+                    },
+                    Fact {
+                        id: "skill-b".into(),
+                        label: "review".into(),
+                        detail: String::new(),
+                        evidence: Evidence::Available,
+                        source: String::new(),
+                        detail_token: Some("token-b".into()),
+                    },
+                ],
+                builtins: vec![Fact {
+                    id: "read".into(),
+                    label: "Read".into(),
+                    detail: String::new(),
+                    evidence: Evidence::Available,
+                    source: String::new(),
+                    detail_token: None,
+                }],
+                tree: vec![TreeNode {
+                    id: "skills".into(),
+                    parent_id: None,
+                    label: "Skills".into(),
+                    fact_ids: vec!["skill-a".into(), "skill-b".into()],
+                    detail_token: None,
+                }],
+                ..Reply::default()
+            },
+        };
+        let theme = ColorTheme::default();
+        let mut ui = CapabilityUiState::default();
+        let collapsed = render_extension_tree(
+            Some(&inspection),
+            Some(&ExtensionsConfig {
+                version: 1,
+                ..ExtensionsConfig::default()
+            }),
+            "%1",
+            "claude",
+            &ui,
+            18,
+            &theme,
+        );
+        assert_eq!(collapsed[0].1.node_id, "skills");
+        assert!(
+            collapsed
+                .iter()
+                .any(|(line, _)| line_text(line).contains("Built-ins: 1"))
+        );
+        assert!(
+            !collapsed
+                .iter()
+                .any(|(_, target)| target.node_id == "fact:read")
+        );
+
+        ui.toggle(&collapsed[0].1);
+        let expanded = render_extension_tree(
+            Some(&inspection),
+            Some(&ExtensionsConfig {
+                version: 1,
+                ..ExtensionsConfig::default()
+            }),
+            "%1",
+            "claude",
+            &ui,
+            18,
+            &theme,
+        );
+        let ids: Vec<_> = expanded
+            .iter()
+            .map(|(_, target)| target.node_id.as_str())
+            .collect();
+        assert!(ids.contains(&"fact:skill-a"));
+        assert!(ids.contains(&"fact:skill-b"));
     }
 
     fn test_ctx<'a>(theme: &'a ColorTheme, inner_width: usize, active: bool) -> RowCtx<'a> {

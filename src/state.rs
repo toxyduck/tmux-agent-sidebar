@@ -4,6 +4,7 @@ use crate::ui::colors::ColorTheme;
 use crate::ui::icons::StatusIcons;
 
 mod activity;
+mod extensions;
 mod filter;
 mod focus;
 mod global;
@@ -19,10 +20,13 @@ mod tab;
 mod timers;
 
 pub use activity::ActivityState;
+pub use extensions::{CapabilityUiState, DetailView, ExtensionsState, TreeTarget};
 pub use filter::{RepoFilter, StatusFilter};
 pub use focus::{Focus, FocusState};
 pub use global::GlobalState;
-pub use layout::{FrameLayout, HyperlinkOverlay, RepoSpawnTarget, RowTarget, SpawnRemoveTarget};
+pub use layout::{
+    FrameLayout, HyperlinkOverlay, RepoSpawnTarget, RowTarget, SpawnRemoveTarget, SubagentTarget,
+};
 pub(crate) use notices::debug_forced_display;
 pub use notices::{ClaudePluginNotice, NoticesCopyTarget, NoticesMissingHookGroup, NoticesState};
 pub use pane_runtime::{PaneRuntimeMap, PaneRuntimeState};
@@ -64,6 +68,11 @@ pub struct AppState {
     pub bottom_tab: BottomTab,
     pub git: crate::git::GitData,
     pub pane_states: PaneRuntimeMap,
+    /// External capability collector snapshots, keyed by original tmux pane.
+    pub extensions: ExtensionsState,
+    /// Exact child selected in the tree. `Enter` reuses this same target as a
+    /// mouse click; it is cleared whenever the pane list is rebuilt.
+    pub selected_subagent_target: Option<SubagentTarget>,
     /// Periodic-refresh clocks (port scan, session-name scan, filter
     /// debounce, port-scan first-run flag).
     pub timers: RefreshTimers,
@@ -137,6 +146,55 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Uniform child activation: focus the original pane, then ask the
+    /// provider collector to open its native viewer. No pane/session is made.
+    pub fn activate_subagent(&mut self, target: SubagentTarget) {
+        crate::tmux::select_pane(&target.parent_pane_id);
+        let session_id = self
+            .pane_by_id(&target.parent_pane_id)
+            .and_then(|pane| pane.session_id.clone());
+        if let Err(error) = self.extensions.queue_activate(target, session_id) {
+            self.set_flash(format!("Native viewer unavailable: {error}"));
+        }
+    }
+
+    /// Resolve a provider-owned detail token and replace the sidebar content.
+    /// The prior tree cursor and its scroll offset are retained for Esc/Left.
+    pub fn open_selected_capability_detail(&mut self) {
+        let Some(target) = self.extensions.ui.selected.clone() else {
+            return;
+        };
+        let Some(_) = target.detail_token.as_deref() else {
+            return;
+        };
+        let session_id = self
+            .pane_by_id(&target.parent_pane_id)
+            .and_then(|pane| pane.session_id.clone());
+        if let Err(error) =
+            self.extensions
+                .queue_detail(target, session_id, self.scrolls.panes.offset)
+        {
+            self.set_flash(format!("Detail unavailable: {error}"));
+        }
+    }
+
+    pub fn close_capability_detail(&mut self) {
+        if let Some(detail) = self.extensions.ui.detail.take() {
+            self.extensions.ui.selected = detail.previous_selection;
+            self.scrolls.panes.offset = detail.previous_pane_scroll;
+        }
+    }
+
+    pub fn scroll_detail(&mut self, delta: isize) {
+        let Some(detail) = self.extensions.ui.detail.as_mut() else {
+            return;
+        };
+        if delta.is_negative() {
+            detail.scroll = detail.scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            detail.scroll = detail.scroll.saturating_add(delta as usize);
+        }
+    }
     pub fn new(tmux_pane: String) -> Self {
         let mut state = Self {
             now: 0,
@@ -153,6 +211,8 @@ impl AppState {
             bottom_tab: BottomTab::Activity,
             git: crate::git::GitData::default(),
             pane_states: PaneRuntimeMap::new(),
+            extensions: ExtensionsState::load(),
+            selected_subagent_target: None,
             timers: RefreshTimers::default(),
             popup: PopupState::None,
             notices: NoticesState::default(),
@@ -185,6 +245,56 @@ impl AppState {
         crate::state::pet::reseed_pet_idle_motion(&mut state);
         state
     }
+}
+
+impl AppState {
+    pub(crate) fn apply_extension_results(&mut self) {
+        for result in self.extensions.take_results() {
+            match result {
+                extensions::WorkerResult::Inspect { .. } => {}
+                extensions::WorkerResult::Detail {
+                    target,
+                    previous_pane_scroll,
+                    result,
+                } => match result {
+                    Ok(detail) => {
+                        self.extensions.ui.detail = Some(DetailView {
+                            title: detail.title,
+                            source: canonical_source(&detail.source),
+                            text: sanitize_detail_text(&detail.text),
+                            scroll: 0,
+                            previous_selection: Some(target),
+                            previous_pane_scroll,
+                        });
+                    }
+                    Err(error) => self.set_flash(format!("Detail unavailable: {error}")),
+                },
+                extensions::WorkerResult::Activate { result } => match result {
+                    Ok(reply) if reply.error.is_none() => {}
+                    Ok(reply) => self.set_flash(format!(
+                        "Native viewer unavailable: {}",
+                        reply.error.unwrap_or_default()
+                    )),
+                    Err(error) => self.set_flash(format!("Native viewer unavailable: {error}")),
+                },
+            }
+        }
+    }
+}
+
+fn sanitize_detail_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| *ch == '\n' || *ch == '\t' || !ch.is_control())
+        .collect()
+}
+
+fn canonical_source(source: &str) -> String {
+    if source.is_empty() {
+        return String::new();
+    }
+    std::fs::canonicalize(source)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| source.to_string())
 }
 
 #[cfg(test)]

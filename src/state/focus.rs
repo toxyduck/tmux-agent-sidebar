@@ -74,6 +74,8 @@ impl AppState {
         let next = self.global.selected_pane_row as isize + delta;
         if next >= 0 && next < len {
             self.global.selected_pane_row = next as usize;
+            self.extensions.ui.selected = None;
+            self.selected_subagent_target = None;
             true
         } else {
             false

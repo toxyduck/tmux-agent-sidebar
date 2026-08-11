@@ -5,6 +5,7 @@ pub mod cli;
 pub mod clipboard;
 pub mod desktop_notification;
 pub mod event;
+pub mod extension;
 pub mod git;
 pub mod group;
 pub mod port;

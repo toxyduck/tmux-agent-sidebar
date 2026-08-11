@@ -21,6 +21,9 @@ pub struct PaneRuntimeState {
     /// Used by `refresh_task_progress` to skip the (potentially expensive)
     /// re-parse when the log has not been touched since the previous tick.
     pub task_progress_log_mtime: Option<std::time::SystemTime>,
+    /// File length complements mtime on filesystems with coarse timestamp
+    /// resolution, so an appended task is never hidden by a stale cache.
+    pub task_progress_log_len: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

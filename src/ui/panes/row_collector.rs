@@ -5,7 +5,7 @@ use ratatui::{
 
 use super::SPAWN_BUTTON;
 use super::row;
-use crate::state::{AppState, Focus};
+use crate::state::{AppState, Focus, TreeTarget};
 use crate::ui::text::display_width;
 
 #[derive(Debug, Default)]
@@ -14,6 +14,8 @@ pub(super) struct CollectedRows {
     pub line_to_row: Vec<Option<usize>>,
     pub pending_spawn: Vec<(usize, String, String)>,
     pub pending_remove: Vec<(usize, u16, String)>,
+    pub pending_subagents: Vec<(usize, String, String, String, String)>,
+    pub pending_tree: Vec<(usize, TreeTarget)>,
 }
 
 pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
@@ -117,6 +119,71 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                 state.spinner_frame,
                 state.now,
             );
+            let mut pane_lines = pane_lines;
+            // Capability collectors return stable child identities. Show their
+            // tree only for the selected parent and bind clicks directly to
+            // those identities; legacy display labels remain non-interactive.
+            if is_selected {
+                if let Some(inspection) = state.extensions.inspection(
+                    &pane.pane_id,
+                    pane.agent.as_str(),
+                    pane.session_id.as_deref(),
+                ) {
+                    for agent in inspection
+                        .reply
+                        .agents
+                        .iter()
+                        .filter(|agent| agent.parent_id.is_some())
+                    {
+                        let line = collected.lines.len() + pane_lines.len();
+                        let model = agent
+                            .model
+                            .as_deref()
+                            .map(|model| format!("  {model}"))
+                            .unwrap_or_default();
+                        pane_lines.push(Line::from(Span::styled(
+                            format!("  └ {}{model}", agent.label),
+                            Style::default().fg(theme.subagent),
+                        )));
+                        collected.pending_subagents.push((
+                            line,
+                            pane.pane_id.clone(),
+                            pane.agent.as_str().to_string(),
+                            agent.id.clone(),
+                            agent.id.clone(),
+                        ));
+                    }
+                }
+                // Capabilities are intentionally rendered only for the selected
+                // parent AgentNode. Their click identity uses TreeNode.id, never
+                // a duplicate label or current line offset.
+                let tree_start = collected.lines.len() + pane_lines.len();
+                for (offset, (line, target)) in row::render_extension_tree(
+                    state.extensions.inspection(
+                        &pane.pane_id,
+                        pane.agent.as_str(),
+                        pane.session_id.as_deref(),
+                    ),
+                    state.extensions.config.as_ref(),
+                    &pane.pane_id,
+                    pane.agent.as_str(),
+                    &state.extensions.ui,
+                    width,
+                    theme,
+                )
+                .into_iter()
+                .enumerate()
+                {
+                    pane_lines.push(line);
+                    collected.pending_tree.push((tree_start + offset, target));
+                }
+                if let Some(error) = &state.extensions.config_error {
+                    pane_lines.push(Line::from(Span::styled(
+                        format!("  × {error}"),
+                        Style::default().fg(theme.status_error),
+                    )));
+                }
+            }
             let pane_line_count = pane_lines.len();
             collected.lines.extend(pane_lines);
             for _ in 0..pane_line_count {

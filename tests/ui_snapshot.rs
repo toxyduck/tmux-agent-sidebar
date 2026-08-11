@@ -4,7 +4,7 @@ mod test_helpers;
 use test_helpers::*;
 use tmux_agent_sidebar::activity::{ActivityEntry, TaskProgress, TaskStatus};
 use tmux_agent_sidebar::group::{PaneGitInfo, RepoGroup};
-use tmux_agent_sidebar::state::{Focus, PopupState, RepoFilter, StatusFilter};
+use tmux_agent_sidebar::state::{DetailView, Focus, PopupState, RepoFilter, StatusFilter};
 use tmux_agent_sidebar::tmux::{
     AgentType, PaneInfo, PaneStatus, PermissionMode, SessionInfo, WindowInfo, WorktreeMetadata,
 };
@@ -36,6 +36,31 @@ fn snapshot_single_agent_idle_ui() {
     ╭ Activity │ Git ──────────╮
     │      No activity yet     │
     ╰──────────────────────────╯
+    ");
+}
+
+#[test]
+fn snapshot_capability_detail_replaces_sidebar_at_narrow_width() {
+    let mut state = make_state(vec![]);
+    state.bottom_panel_height = 20;
+    state.extensions.ui.detail = Some(DetailView {
+        title: "Project instructions".into(),
+        source: "/repo/AGENTS.md".into(),
+        text: "First rule: use the project skill.\nSecond rule: preserve IDs.".into(),
+        scroll: 0,
+        previous_selection: None,
+        previous_pane_scroll: 0,
+    });
+
+    let output = render_to_string(&mut state, 22, 8);
+    insta::assert_snapshot!(output, @r"
+    ╭ Project instructio…╮
+    │Source: /repo/AGENT…│
+    │First rule: use the │
+    │project skill.      │
+    │Second rule:        │
+    │preserve IDs.       │
+    ╰────────────────────╯
     ");
 }
 

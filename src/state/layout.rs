@@ -1,8 +1,19 @@
-use super::{AppState, RepoFilter, StatusFilter};
+use super::{AppState, RepoFilter, StatusFilter, TreeTarget};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct RowTarget {
     pub pane_id: String,
+}
+
+/// A child displayed under a parent pane. Every identifier comes from the
+/// provider reply; no activation is resolved from text or a row index.
+#[derive(Debug, Clone)]
+pub struct SubagentTarget {
+    pub parent_pane_id: String,
+    pub provider_id: String,
+    pub agent_id: String,
+    pub node_id: String,
 }
 
 /// Click target for the `+` button rendered at the right edge of each
@@ -49,6 +60,11 @@ pub struct FrameLayout {
     /// `pane_row_targets`. `None` for header/blank lines that should not
     /// route clicks to a pane.
     pub line_to_row: Vec<Option<usize>>,
+    /// Agent-panel source line → exact subagent in its original tmux pane.
+    pub subagent_line_targets: HashMap<usize, SubagentTarget>,
+    /// Agent and capability tree lines rendered for the selected pane.
+    /// Stable `node_id` makes duplicate labels safe to select and disclose.
+    pub tree_line_targets: HashMap<usize, TreeTarget>,
     /// X column of the repo filter button in the secondary header. `None`
     /// when the button is hidden. Used for click hit-testing.
     pub repo_button_col: Option<u16>,
@@ -108,7 +124,9 @@ impl AppState {
         delta: isize,
     ) {
         let bottom_start = term_height.saturating_sub(bottom_panel_height);
-        if row >= bottom_start {
+        if self.extensions.ui.detail.is_some() {
+            self.scroll_detail(delta);
+        } else if row >= bottom_start {
             self.scroll_bottom(delta);
         } else {
             self.scrolls.panes.scroll(delta);
@@ -270,8 +288,23 @@ impl AppState {
         }
 
         let line_index = (row as usize - 2) + self.scrolls.panes.offset;
+        if let Some(target) = self.layout.tree_line_targets.get(&line_index).cloned() {
+            if target.is_disclosure {
+                self.extensions.ui.toggle(&target);
+            } else {
+                self.extensions.ui.selected = Some(target);
+            }
+            return;
+        }
+        if let Some(target) = self.layout.subagent_line_targets.get(&line_index).cloned() {
+            self.selected_subagent_target = Some(target.clone());
+            self.activate_subagent(target);
+            return;
+        }
         if let Some(Some(agent_row)) = self.layout.line_to_row.get(line_index) {
             self.global.selected_pane_row = *agent_row;
+            self.extensions.ui.selected = None;
+            self.selected_subagent_target = None;
             self.global.queue_cursor_save();
             self.activate_selected_pane();
         }

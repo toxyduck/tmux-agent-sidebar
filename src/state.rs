@@ -22,7 +22,10 @@ mod timers;
 pub use activity::ActivityState;
 #[cfg(test)]
 pub(crate) use extensions::TestControlQueue;
-pub use extensions::{CapabilityUiState, DetailView, ExtensionsState, InlineDetail, TreeTarget};
+pub use extensions::{
+    CapabilityUiState, DetailView, ExtensionsState, InlineDetail, TranscriptUiState,
+    TranscriptView, TreeTarget,
+};
 pub use filter::{RepoFilter, StatusFilter};
 pub use focus::{Focus, FocusState};
 pub use global::GlobalState;
@@ -162,6 +165,20 @@ impl AppState {
             self.set_flash("Native viewer unavailable: stale subagent target".to_string());
             return;
         }
+        if self.subagent_has_completed_transcript(&target) {
+            let (_, cwd, pane_pid, current_command) = self.pane_context(&target.parent_pane_id);
+            if let Err(error) = self.extensions.queue_transcript(
+                target,
+                cwd,
+                pane_pid,
+                current_command,
+                self.extensions.ui.selected.clone(),
+                self.scrolls.panes.offset,
+            ) {
+                self.set_flash(format!("Transcript unavailable: {error}"));
+            }
+            return;
+        }
         crate::tmux::select_pane(&target.parent_pane_id);
         let (_, cwd, pane_pid, current_command) = self.pane_context(&target.parent_pane_id);
         if let Err(error) = self
@@ -238,6 +255,32 @@ impl AppState {
             })
     }
 
+    fn subagent_has_completed_transcript(&self, target: &SubagentTarget) -> bool {
+        self.extensions
+            .inspection(
+                &target.parent_pane_id,
+                &target.provider_id,
+                target.session_id.as_deref(),
+            )
+            .is_some_and(|inspection| {
+                !inspection.stale
+                    && inspection.reply.capabilities.iter().any(|capability| {
+                        capability == crate::extension::CAPABILITY_AGENT_LIFECYCLE_V1
+                    })
+                    && inspection
+                        .reply
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == crate::extension::CAPABILITY_TRANSCRIPT_V1)
+                    && inspection.reply.agents.iter().any(|agent| {
+                        agent.id == target.agent_id
+                            && agent.parent_id.is_some()
+                            && agent.lifecycle == crate::extension::AgentLifecycle::Completed
+                            && agent.transcript_available
+                    })
+            })
+    }
+
     pub fn close_capability_detail(&mut self) {
         if let Some(detail) = self.extensions.ui.detail.take() {
             self.extensions.ui.selected = detail.previous_selection;
@@ -253,6 +296,25 @@ impl AppState {
             detail.scroll = detail.scroll.saturating_sub(delta.unsigned_abs());
         } else {
             detail.scroll = detail.scroll.saturating_add(delta as usize);
+        }
+    }
+
+    pub fn close_transcript(&mut self) {
+        self.extensions.ui.transcript.loading = None;
+        if let Some(view) = self.extensions.ui.transcript.view.take() {
+            self.extensions.ui.selected = view.previous_selection;
+            self.scrolls.panes.offset = view.previous_pane_scroll;
+        }
+    }
+
+    pub fn scroll_transcript(&mut self, delta: isize) {
+        let Some(view) = self.extensions.ui.transcript.view.as_mut() else {
+            return;
+        };
+        if delta.is_negative() {
+            view.scroll = view.scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            view.scroll = view.scroll.saturating_add(delta as usize);
         }
     }
     pub fn new(tmux_pane: String) -> Self {
@@ -383,16 +445,79 @@ impl AppState {
                     }
                     Err(error) => self.set_flash(format!("Detail unavailable: {error}")),
                 },
-                extensions::WorkerResult::Activate { result } => match result {
-                    Ok(reply) if reply.error.is_none() => {}
-                    Ok(reply) => self.set_flash(format!(
-                        "Native viewer unavailable: {}",
-                        reply.error.unwrap_or_default()
-                    )),
-                    Err(error) => self.set_flash(format!("Native viewer unavailable: {error}")),
+                extensions::WorkerResult::Activate {
+                    request_id,
+                    target,
+                    result,
+                } => {
+                    let pending = self.extensions.pending_native_open.take();
+                    if pending.as_ref().is_none_or(|pending| {
+                        pending.id != request_id
+                            || pending.target != target
+                            || !self.subagent_target_matches_live_inspection(&target)
+                    }) {
+                        continue;
+                    }
+                    match result {
+                        Ok(reply)
+                            if reply.error.is_none()
+                                && reply.activation_outcome
+                                    == Some(
+                                        crate::extension::ActivationOutcome::TranscriptFallback,
+                                    )
+                                && reply.capabilities.iter().any(|capability| {
+                                    capability == crate::extension::CAPABILITY_ACTIVATION_OUTCOME_V1
+                                })
+                                && reply.capabilities.iter().any(|capability| {
+                                    capability == crate::extension::CAPABILITY_TRANSCRIPT_V1
+                                }) =>
+                        {
+                            let (_, cwd, pane_pid, current_command) =
+                                self.pane_context(&target.parent_pane_id);
+                            if let Err(error) = self.extensions.queue_transcript(
+                                target,
+                                cwd,
+                                pane_pid,
+                                current_command,
+                                self.extensions.ui.selected.clone(),
+                                self.scrolls.panes.offset,
+                            ) {
+                                self.set_flash(format!("Transcript unavailable: {error}"));
+                            }
+                        }
+                        Ok(reply) if reply.error.is_none() => {}
+                        Ok(reply) => self.set_flash(format!(
+                            "Native viewer unavailable: {}",
+                            reply.error.unwrap_or_default()
+                        )),
+                        Err(error) => self.set_flash(format!("Native viewer unavailable: {error}")),
+                    }
+                }
+                extensions::WorkerResult::Transcript { request, result } => match result {
+                    Ok(document) if self.accepts_transcript(&request) => {
+                        self.extensions.ui.transcript.loading = None;
+                        self.extensions.ui.transcript.view = Some(extensions::TranscriptView {
+                            target: request.target,
+                            document,
+                            scroll: 0,
+                            previous_selection: request.previous_selection,
+                            previous_pane_scroll: request.previous_pane_scroll,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) if self.accepts_transcript(&request) => {
+                        self.extensions.ui.transcript.loading = None;
+                        self.set_flash(format!("Transcript unavailable: {error}"));
+                    }
+                    Err(_) => {}
                 },
             }
         }
+    }
+
+    fn accepts_transcript(&self, request: &extensions::TranscriptRequest) -> bool {
+        self.extensions.ui.transcript.loading.as_ref() == Some(request)
+            && self.subagent_target_matches_live_inspection(&request.target)
     }
 
     fn capability_target_matches_live_pane(&self, target: &TreeTarget) -> bool {

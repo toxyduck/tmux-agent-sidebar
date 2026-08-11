@@ -76,6 +76,17 @@ pub(super) fn handle_key_event(
     state: &mut AppState,
     git_tab_active: &AtomicBool,
 ) -> bool {
+    if state.extensions.ui.transcript.view.is_some()
+        || state.extensions.ui.transcript.loading.is_some()
+    {
+        match key.code {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => state.close_transcript(),
+            KeyCode::Char('j') | KeyCode::Down => state.scroll_transcript(1),
+            KeyCode::Char('k') | KeyCode::Up => state.scroll_transcript(-1),
+            _ => {}
+        }
+        return true;
+    }
     if state.extensions.ui.detail.is_some() {
         match key.code {
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => state.close_capability_detail(),
@@ -282,9 +293,12 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use crate::extension::{AgentNode, AgentRole, ExtensionsConfig, ProviderConfig, Reply};
+    use crate::extension::{
+        AgentNode, AgentRole, ExtensionsConfig, ProviderConfig, Reply, TranscriptDocument,
+        TranscriptItem,
+    };
     use crate::group::RepoGroup;
-    use crate::state::{NavigationTarget, RowTarget, SubagentTarget, TreeTarget};
+    use crate::state::{NavigationTarget, RowTarget, SubagentTarget, TranscriptView, TreeTarget};
     use crate::tmux::{AgentType, PaneInfo, PaneStatus, PermissionMode, WorktreeMetadata};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -379,6 +393,8 @@ mod tests {
                         label: "Main".into(),
                         role: AgentRole::Main,
                         model: None,
+                        lifecycle: Default::default(),
+                        transcript_available: false,
                     },
                     AgentNode {
                         id: "child".into(),
@@ -386,6 +402,8 @@ mod tests {
                         label: "Child".into(),
                         role: AgentRole::Subagent,
                         model: None,
+                        lifecycle: Default::default(),
+                        transcript_available: false,
                     },
                 ],
                 ..Reply::default()
@@ -647,6 +665,53 @@ mod tests {
         assert_eq!(state.extensions.ui.detail.as_ref().unwrap().scroll, 1);
         handle_key_event(key(KeyCode::Esc), &mut state, &flag);
         assert!(state.extensions.ui.detail.is_none());
+        assert_eq!(state.extensions.ui.selected, Some(target));
+        assert_eq!(state.scrolls.panes.offset, 4);
+    }
+
+    #[test]
+    fn transcript_view_scrolls_and_esc_restores_tree_selection() {
+        let mut state = state_with_three_panes();
+        let target = TreeTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            session_id: Some("session".into()),
+            agent_id: "worker".into(),
+            node_id: "skills".into(),
+            detail_token: None,
+            inline_detail: None,
+            is_disclosure: true,
+        };
+        state.scrolls.panes.offset = 4;
+        state.extensions.ui.transcript.view = Some(TranscriptView {
+            target: SubagentTarget {
+                parent_pane_id: "%1".into(),
+                provider_id: "claude".into(),
+                session_id: Some("session".into()),
+                agent_id: "worker".into(),
+                node_id: "worker".into(),
+            },
+            document: TranscriptDocument {
+                title: "Worker".into(),
+                source: String::new(),
+                items: vec![TranscriptItem {
+                    role: "assistant".into(),
+                    text: "done".into(),
+                }],
+            },
+            scroll: 0,
+            previous_selection: Some(target.clone()),
+            previous_pane_scroll: 4,
+        });
+        let flag = AtomicBool::new(false);
+
+        handle_key_event(key(KeyCode::Char('j')), &mut state, &flag);
+        assert_eq!(
+            state.extensions.ui.transcript.view.as_ref().unwrap().scroll,
+            1
+        );
+        handle_key_event(key(KeyCode::Esc), &mut state, &flag);
+        assert!(state.extensions.ui.transcript.view.is_none());
         assert_eq!(state.extensions.ui.selected, Some(target));
         assert_eq!(state.scrolls.panes.offset, 4);
     }

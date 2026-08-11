@@ -3,8 +3,11 @@ mod test_helpers;
 
 use test_helpers::*;
 use tmux_agent_sidebar::activity::{ActivityEntry, TaskProgress, TaskStatus};
+use tmux_agent_sidebar::extension::{TranscriptDocument, TranscriptItem};
 use tmux_agent_sidebar::group::{PaneGitInfo, RepoGroup};
-use tmux_agent_sidebar::state::{DetailView, Focus, PopupState, RepoFilter, StatusFilter};
+use tmux_agent_sidebar::state::{
+    DetailView, Focus, PopupState, RepoFilter, StatusFilter, SubagentTarget, TranscriptView,
+};
 use tmux_agent_sidebar::tmux::{
     AgentType, PaneInfo, PaneStatus, PermissionMode, SessionInfo, WindowInfo, WorktreeMetadata,
 };
@@ -60,6 +63,40 @@ fn snapshot_capability_detail_replaces_sidebar_at_narrow_width() {
     │project skill.      │
     │Second rule:        │
     │preserve IDs.       │
+    ╰────────────────────╯
+    ");
+}
+
+#[test]
+fn snapshot_transcript_replaces_sidebar_at_narrow_width() {
+    let mut state = make_state(vec![]);
+    state.extensions.ui.transcript.view = Some(TranscriptView {
+        target: SubagentTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            session_id: Some("session".into()),
+            agent_id: "worker".into(),
+            node_id: "worker".into(),
+        },
+        document: TranscriptDocument {
+            title: "Worker transcript".into(),
+            source: String::new(),
+            items: vec![TranscriptItem {
+                role: "assistant".into(),
+                text: "Finished the narrow viewer contract.".into(),
+            }],
+        },
+        scroll: 0,
+        previous_selection: None,
+        previous_pane_scroll: 0,
+    });
+
+    let output = render_to_string(&mut state, 22, 8);
+    insta::assert_snapshot!(output, @r"
+    ╭ Worker transcript ─╮
+    │assistant:          │
+    │Finished the narrow │
+    │viewer contract.    │
     ╰────────────────────╯
     ");
 }

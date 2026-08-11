@@ -677,6 +677,58 @@ pub fn draw_detail(frame: &mut Frame, state: &mut AppState, area: Rect) {
     );
 }
 
+/// Transcript documents use the same full-sidebar surface as capability
+/// details. The document is transient state, so no collector text appears in
+/// notices, cache rows, or diagnostic UI.
+pub fn draw_transcript(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let theme = &state.theme;
+    let (title, text, scroll) = if let Some(view) = state.extensions.ui.transcript.view.as_ref() {
+        let mut text = String::new();
+        for item in &view.document.items {
+            if !item.role.is_empty() {
+                text.push_str(&item.role);
+                text.push_str(":\n");
+            }
+            text.push_str(&item.text);
+            text.push_str("\n\n");
+        }
+        (view.document.title.clone(), text, view.scroll)
+    } else {
+        (
+            "Transcript".to_string(),
+            "Loading transcript…".to_string(),
+            0,
+        )
+    };
+    let title = truncate_to_width(
+        &format!(" {} ", title),
+        area.width.saturating_sub(2) as usize,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().fg(theme.text_active))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        inner,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

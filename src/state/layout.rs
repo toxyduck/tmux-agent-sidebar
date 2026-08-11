@@ -142,7 +142,11 @@ impl AppState {
         delta: isize,
     ) {
         let bottom_start = term_height.saturating_sub(bottom_panel_height);
-        if self.extensions.ui.detail.is_some() {
+        if self.extensions.ui.transcript.view.is_some()
+            || self.extensions.ui.transcript.loading.is_some()
+        {
+            self.scroll_transcript(delta);
+        } else if self.extensions.ui.detail.is_some() {
             self.scroll_detail(delta);
         } else if row >= bottom_start {
             self.scroll_bottom(delta);

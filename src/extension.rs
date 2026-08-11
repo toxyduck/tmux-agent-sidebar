@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+/// The sidebar deliberately negotiates only named v1 features. Unknown
+/// collector features are ignored so a newer collector remains compatible.
+pub const CAPABILITY_AGENT_LIFECYCLE_V1: &str = "agent_lifecycle_v1";
+pub const CAPABILITY_TRANSCRIPT_V1: &str = "transcript_v1";
+pub const CAPABILITY_ACTIVATION_OUTCOME_V1: &str = "activation_outcome_v1";
 const DEFAULT_TIMEOUT_MS: u64 = 750;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -75,6 +80,18 @@ pub struct ActivationRequest<'a> {
     pub pane_id: &'a str,
     pub session_id: Option<&'a str>,
     pub subagent_id: &'a str,
+    pub cwd: Option<&'a str>,
+    pub pane_pid: Option<u32>,
+    pub current_command: Option<&'a str>,
+}
+
+/// Fully scoped transcript request. This is distinct from the transient UI
+/// request id, which never leaves the sidebar process.
+pub struct TranscriptRequest<'a> {
+    pub provider: &'a str,
+    pub pane_id: &'a str,
+    pub session_id: Option<&'a str>,
+    pub agent_id: &'a str,
     pub cwd: Option<&'a str>,
     pub pane_pid: Option<u32>,
     pub current_command: Option<&'a str>,
@@ -160,6 +177,27 @@ pub enum AgentRole {
     Unknown,
 }
 
+/// Provider-neutral lifecycle state for an agent. `Unknown` is intentional:
+/// callers must retain the native viewer path rather than guessing completion.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLifecycle {
+    Running,
+    Completed,
+    #[default]
+    Unknown,
+}
+
+/// Collector response to the native activation operation. A transcript
+/// fallback is valid only after the sidebar has already validated the parent
+/// pane and selected subagent target.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationOutcome {
+    NativeOpened,
+    TranscriptFallback,
+}
+
 impl AgentRole {
     pub const fn display_name(self) -> &'static str {
         match self {
@@ -185,6 +223,12 @@ pub struct AgentNode {
     pub role: AgentRole,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub lifecycle: AgentLifecycle,
+    /// `true` only when a `transcript` request can return this agent's
+    /// document for the inspected pane/session scope.
+    #[serde(default)]
+    pub transcript_available: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -215,7 +259,28 @@ pub struct Detail {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+/// A bounded transcript document. It intentionally does not derive `Debug`:
+/// collector text may contain sensitive command output and must not leak into
+/// diagnostic logs.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TranscriptDocument {
+    pub title: String,
+    #[serde(default)]
+    pub source: String,
+    pub items: Vec<TranscriptItem>,
+}
+
+/// One bounded transcript row. `text` accepts the legacy `content` spelling
+/// without making the core interpret a provider-specific transcript format.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TranscriptItem {
+    #[serde(default)]
+    pub role: String,
+    #[serde(alias = "content")]
+    pub text: String,
+}
+
+#[derive(Clone, Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Reply {
     pub version: u32,
@@ -226,9 +291,13 @@ pub struct Reply {
     pub agents: Vec<AgentNode>,
     pub tree: Vec<TreeNode>,
     pub detail: Option<Detail>,
+    /// Collector-advertised optional protocol features.
+    pub capabilities: Vec<String>,
+    pub activation_outcome: Option<ActivationOutcome>,
+    pub transcript: Option<TranscriptDocument>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Inspection {
     pub reply: Reply,
     pub stale: bool,
@@ -387,6 +456,42 @@ pub fn activate(
     )
 }
 
+/// Request a transcript for a selected agent in its inspected pane/session.
+/// The token is the stable agent id, never a local path or rendered label.
+pub fn transcript(
+    config: &ExtensionsConfig,
+    request: TranscriptRequest<'_>,
+) -> Result<TranscriptDocument, String> {
+    let program = config
+        .providers
+        .get(request.provider)
+        .ok_or_else(|| "no collector configured".to_string())?;
+    let reply = call(
+        program,
+        &Request {
+            version: PROTOCOL_VERSION,
+            op: "transcript",
+            provider: request.provider,
+            pane_id: request.pane_id,
+            cwd: request.cwd,
+            session_id: request.session_id,
+            pane_pid: request.pane_pid,
+            current_command: request.current_command,
+            subagent_id: Some(request.agent_id),
+        },
+    )?;
+    if !reply
+        .capabilities
+        .iter()
+        .any(|capability| capability == CAPABILITY_TRANSCRIPT_V1)
+    {
+        return Err("collector did not negotiate transcript_v1".to_string());
+    }
+    reply
+        .transcript
+        .ok_or_else(|| "collector returned no transcript".to_string())
+}
+
 /// Load the text for one selected capability. `detail_token` must have come
 /// from the collector's own inspect reply, so rendered labels can never cause
 /// an arbitrary local file to be read.
@@ -539,6 +644,7 @@ fn terminate(child: &mut std::process::Child) {
 
 fn validate_reply(reply: &Reply) -> Result<(), String> {
     const MAX_TEXT: usize = 4096;
+    const MAX_TRANSCRIPT_ITEMS: usize = 512;
     let valid = |value: &str| !value.is_empty() && value.len() <= MAX_TEXT && is_safe_text(value);
     let mut ids = std::collections::HashSet::new();
     let mut fact_ids = std::collections::HashSet::new();
@@ -576,6 +682,24 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
         {
             return Err("invalid or duplicate agent id".into());
         }
+    }
+    for capability in &reply.capabilities {
+        if !matches!(
+            capability.as_str(),
+            CAPABILITY_AGENT_LIFECYCLE_V1
+                | CAPABILITY_TRANSCRIPT_V1
+                | CAPABILITY_ACTIVATION_OUTCOME_V1
+        ) {
+            return Err("unknown collector capability".into());
+        }
+    }
+    if reply.activation_outcome.is_some()
+        && !reply
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_ACTIVATION_OUTCOME_V1)
+    {
+        return Err("activation outcome was not negotiated".into());
     }
     let parents: std::collections::HashMap<&str, Option<&str>> = reply
         .agents
@@ -715,6 +839,30 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
     {
         return Err("invalid detail reply".into());
     }
+    if let Some(transcript) = &reply.transcript {
+        if !reply
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_TRANSCRIPT_V1)
+            || !valid(&transcript.title)
+            || (!transcript.source.is_empty() && !valid(&transcript.source))
+            || transcript.items.len() > MAX_TRANSCRIPT_ITEMS
+        {
+            return Err("invalid transcript reply".into());
+        }
+        for item in &transcript.items {
+            if item.role.len() > MAX_TEXT
+                || !is_safe_text(&item.role)
+                || item.text.len() > MAX_TEXT
+                || item
+                    .text
+                    .chars()
+                    .any(|ch| ch != '\n' && ch != '\t' && ch.is_control())
+            {
+                return Err("invalid transcript item".into());
+            }
+        }
+    }
     if let Some(error) = &reply.error
         && !valid(error)
     {
@@ -809,6 +957,32 @@ mod tests {
         .unwrap();
         assert_eq!(reply.agents[0].role, AgentRole::Main);
         assert_eq!(reply.agents[1].role, AgentRole::Subagent);
+    }
+
+    #[test]
+    fn transcript_protocol_defaults_for_older_collectors_and_validates_negotiation() {
+        let legacy: Reply =
+            serde_json::from_str(r#"{"version":1,"agents":[{"id":"child","label":"worker"}]}"#)
+                .unwrap();
+        assert_eq!(legacy.agents[0].lifecycle, AgentLifecycle::Unknown);
+        assert!(!legacy.agents[0].transcript_available);
+        assert!(legacy.transcript.is_none());
+
+        let reply: Reply = serde_json::from_str(
+            r#"{"version":1,"capabilities":["agent_lifecycle_v1","transcript_v1","activation_outcome_v1"],"agents":[{"id":"child","label":"worker","lifecycle":"completed","transcript_available":true}],"activation_outcome":"transcript_fallback","transcript":{"title":"Worker","items":[{"role":"assistant","content":"done"}]}}"#,
+        )
+        .unwrap();
+        validate_reply(&reply).unwrap();
+        assert_eq!(reply.transcript.unwrap().items[0].text, "done");
+    }
+
+    #[test]
+    fn transcript_without_negotiated_capability_is_rejected() {
+        let reply: Reply = serde_json::from_str(
+            r#"{"version":1,"transcript":{"title":"Worker","items":[{"text":"done"}]}}"#,
+        )
+        .unwrap();
+        assert!(validate_reply(&reply).unwrap_err().contains("transcript"));
     }
 
     #[cfg(unix)]
@@ -1011,6 +1185,50 @@ mod tests {
         assert_eq!(detail.source, "/tmp/project/SKILL.md");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn transcript_request_keeps_selected_pane_context_and_requires_capability() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("collector");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in *'\"op\":\"transcript\"'*'\"pane_id\":\"%1\"'*'\"cwd\":\"/tmp/project\"'*'\"session_id\":\"session\"'*'\"pane_pid\":42'*'\"current_command\":\"claude\"'*'\"subagent_id\":\"child\"'*) ;; *) exit 7 ;; esac\nprintf '%s' '{\"version\":1,\"capabilities\":[\"transcript_v1\"],\"transcript\":{\"title\":\"Worker\",\"items\":[{\"role\":\"assistant\",\"text\":\"done\"}]}}'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let config = ExtensionsConfig {
+            version: 1,
+            providers: BTreeMap::from([(
+                "claude".into(),
+                ProviderConfig {
+                    argv: vec![script.to_string_lossy().into_owned()],
+                    timeout_ms: 100,
+                    env: BTreeMap::new(),
+                },
+            )]),
+            ..ExtensionsConfig::default()
+        };
+
+        let document = transcript(
+            &config,
+            TranscriptRequest {
+                provider: "claude",
+                pane_id: "%1",
+                cwd: Some("/tmp/project"),
+                session_id: Some("session"),
+                pane_pid: Some(42),
+                current_command: Some("claude"),
+                agent_id: "child",
+            },
+        )
+        .unwrap();
+        assert_eq!(document.items[0].text, "done");
+    }
+
     #[test]
     fn stale_cache_is_preserved_when_collector_fails() {
         let config = ExtensionsConfig {
@@ -1111,6 +1329,8 @@ mod tests {
                 label: "a".into(),
                 role: Default::default(),
                 model: None,
+                lifecycle: Default::default(),
+                transcript_available: false,
             },
             AgentNode {
                 id: "a".into(),
@@ -1118,6 +1338,8 @@ mod tests {
                 label: "b".into(),
                 role: Default::default(),
                 model: None,
+                lifecycle: Default::default(),
+                transcript_available: false,
             },
         ];
         assert!(validate_reply(&reply).unwrap_err().contains("duplicate"));
@@ -1133,6 +1355,8 @@ mod tests {
                 label: "agent".into(),
                 role: Default::default(),
                 model: None,
+                lifecycle: Default::default(),
+                transcript_available: false,
             }],
             tree: vec![
                 TreeNode {
@@ -1170,6 +1394,8 @@ mod tests {
                     label: "one".into(),
                     role: Default::default(),
                     model: None,
+                    lifecycle: Default::default(),
+                    transcript_available: false,
                 },
                 AgentNode {
                     id: "two".into(),
@@ -1177,6 +1403,8 @@ mod tests {
                     label: "two".into(),
                     role: Default::default(),
                     model: None,
+                    lifecycle: Default::default(),
+                    transcript_available: false,
                 },
             ],
             tree: vec![

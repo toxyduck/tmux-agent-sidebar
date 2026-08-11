@@ -71,6 +71,13 @@ pub fn draw(frame: &mut Frame, state: &mut AppState) {
     state.layout.hyperlink_overlays.clear();
     let area = frame.area();
 
+    if state.extensions.ui.transcript.view.is_some()
+        || state.extensions.ui.transcript.loading.is_some()
+    {
+        panes::draw_transcript(frame, state, area);
+        return;
+    }
+
     if state.extensions.ui.detail.is_some() {
         panes::draw_detail(frame, state, area);
         return;

@@ -305,6 +305,8 @@ mod tests {
             label: "Ada".into(),
             role: AgentRole::Main,
             model: Some("model-a".into()),
+            lifecycle: Default::default(),
+            transcript_available: false,
         };
         let subagent = AgentNode {
             id: "subagent".into(),
@@ -312,6 +314,8 @@ mod tests {
             label: "Ada".into(),
             role: AgentRole::Subagent,
             model: None,
+            lifecycle: Default::default(),
+            transcript_available: false,
         };
         let unknown = AgentNode {
             id: "unknown".into(),
@@ -319,6 +323,8 @@ mod tests {
             label: "Ada".into(),
             role: AgentRole::Unknown,
             model: None,
+            lifecycle: Default::default(),
+            transcript_available: false,
         };
 
         assert_eq!(agent_label(&main), "Ada");
@@ -400,6 +406,8 @@ mod tests {
                     label: "Main agent".into(),
                     role: AgentRole::Main,
                     model: None,
+                    lifecycle: Default::default(),
+                    transcript_available: false,
                 }],
                 tree: vec![TreeNode {
                     id: "skills".into(),
@@ -464,6 +472,8 @@ mod tests {
                 label: "Main".into(),
                 role: AgentRole::Main,
                 model: None,
+                lifecycle: Default::default(),
+                transcript_available: false,
             },
             AgentNode {
                 id: "child".into(),
@@ -471,6 +481,8 @@ mod tests {
                 label: "Child".into(),
                 role: AgentRole::Subagent,
                 model: None,
+                lifecycle: Default::default(),
+                transcript_available: false,
             },
         ];
         let subagent = SubagentTarget {

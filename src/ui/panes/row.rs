@@ -579,6 +579,8 @@ mod tests {
                     label: "agent".into(),
                     role: Default::default(),
                     model: None,
+                    lifecycle: Default::default(),
+                    transcript_available: false,
                 }],
                 builtins: vec![crate::extension::BuiltinSummary {
                     agent_id: "agent-1".into(),
@@ -691,6 +693,8 @@ mod tests {
                     label: "Ada".into(),
                     role: AgentRole::Main,
                     model: None,
+                    lifecycle: Default::default(),
+                    transcript_available: false,
                 }],
                 facts,
                 tree: vec![TreeNode {
@@ -786,6 +790,8 @@ mod tests {
                 label: "Ada".into(),
                 role: AgentRole::Main,
                 model: None,
+                lifecycle: Default::default(),
+                transcript_available: false,
             }],
             facts: vec![used.clone()],
             ..Reply::default()
@@ -868,6 +874,8 @@ mod tests {
                         label: "root".into(),
                         role: Default::default(),
                         model: None,
+                        lifecycle: Default::default(),
+                        transcript_available: false,
                     },
                     AgentNode {
                         id: "child".into(),
@@ -875,6 +883,8 @@ mod tests {
                         label: "child".into(),
                         role: Default::default(),
                         model: None,
+                        lifecycle: Default::default(),
+                        transcript_available: false,
                     },
                 ],
                 facts: vec![
@@ -972,6 +982,8 @@ mod tests {
                     label: "agent".into(),
                     role: Default::default(),
                     model: None,
+                    lifecycle: Default::default(),
+                    transcript_available: false,
                 }],
                 builtins: vec![BuiltinSummary {
                     agent_id: "agent".into(),

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::extension::{self, Detail, ExtensionsConfig, Inspection, Reply};
+use crate::extension::{self, Detail, ExtensionsConfig, Inspection, Reply, TranscriptDocument};
 
 /// A frame target is identified by collector data, never by a rendered label
 /// or a row number. Duplicate agent/capability labels are therefore harmless.
@@ -39,11 +39,42 @@ pub struct DetailView {
     pub previous_pane_scroll: usize,
 }
 
-#[derive(Debug, Default)]
+/// Full-sidebar transcript state. Documents live only while the viewer is
+/// open; no transcript text is retained in inspection caches or notices.
+#[derive(Default)]
+pub struct TranscriptUiState {
+    pub loading: Option<TranscriptRequest>,
+    pub view: Option<TranscriptView>,
+}
+
+pub struct TranscriptView {
+    pub target: crate::state::SubagentTarget,
+    pub document: TranscriptDocument,
+    pub scroll: usize,
+    pub previous_selection: Option<TreeTarget>,
+    pub previous_pane_scroll: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TranscriptRequest {
+    pub id: u64,
+    pub target: crate::state::SubagentTarget,
+    pub previous_selection: Option<TreeTarget>,
+    pub previous_pane_scroll: usize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PendingNativeOpen {
+    pub id: u64,
+    pub target: crate::state::SubagentTarget,
+}
+
+#[derive(Default)]
 pub struct CapabilityUiState {
     expanded: HashSet<DisclosureKey>,
     pub selected: Option<TreeTarget>,
     pub detail: Option<DetailView>,
+    pub transcript: TranscriptUiState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -278,7 +309,15 @@ enum WorkerRequest {
         config: ExtensionsConfig,
     },
     Activate {
+        request_id: u64,
         target: crate::state::SubagentTarget,
+        cwd: Option<String>,
+        pane_pid: Option<u32>,
+        current_command: Option<String>,
+        config: ExtensionsConfig,
+    },
+    Transcript {
+        request: TranscriptRequest,
         cwd: Option<String>,
         pane_pid: Option<u32>,
         current_command: Option<String>,
@@ -297,7 +336,13 @@ pub(crate) enum WorkerResult {
         result: Result<Detail, String>,
     },
     Activate {
+        request_id: u64,
+        target: crate::state::SubagentTarget,
         result: Result<Reply, String>,
+    },
+    Transcript {
+        request: TranscriptRequest,
+        result: Result<TranscriptDocument, String>,
     },
 }
 
@@ -313,6 +358,8 @@ pub struct ExtensionsState {
     rx: Receiver<WorkerResult>,
     last_refresh: Instant,
     pub ui: CapabilityUiState,
+    next_request_id: u64,
+    pub pending_native_open: Option<PendingNativeOpen>,
 }
 
 #[cfg(test)]
@@ -367,6 +414,8 @@ impl ExtensionsState {
                 rx,
                 last_refresh: Instant::now(),
                 ui: CapabilityUiState::default(),
+                next_request_id: 0,
+                pending_native_open: None,
             },
             TestControlQueue(control_rx),
         )
@@ -413,6 +462,8 @@ impl ExtensionsState {
             rx,
             last_refresh: Instant::now() - Duration::from_secs(2),
             ui: CapabilityUiState::default(),
+            next_request_id: 0,
+            pending_native_open: None,
         };
         state.reload_config(true);
         state
@@ -511,18 +562,66 @@ impl ExtensionsState {
         cwd: Option<String>,
         pane_pid: Option<u32>,
         current_command: Option<String>,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         let config = self
             .config
             .clone()
             .ok_or_else(|| "no provider collector configured".to_string())?;
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
         self.control_tx
             .try_send(WorkerRequest::Activate {
-                target,
+                request_id,
+                target: target.clone(),
                 cwd,
                 pane_pid,
                 current_command,
                 config,
+            })
+            .map(|()| {
+                self.pending_native_open = Some(PendingNativeOpen {
+                    id: request_id,
+                    target,
+                });
+                request_id
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => "collector queue is full".to_string(),
+                TrySendError::Disconnected(_) => "collector worker stopped".to_string(),
+            })
+    }
+
+    pub fn queue_transcript(
+        &mut self,
+        target: crate::state::SubagentTarget,
+        cwd: Option<String>,
+        pane_pid: Option<u32>,
+        current_command: Option<String>,
+        previous_selection: Option<TreeTarget>,
+        previous_pane_scroll: usize,
+    ) -> Result<u64, String> {
+        let config = self
+            .config
+            .clone()
+            .ok_or_else(|| "no provider collector configured".to_string())?;
+        let request = TranscriptRequest {
+            id: self.next_request_id,
+            target,
+            previous_selection,
+            previous_pane_scroll,
+        };
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.control_tx
+            .try_send(WorkerRequest::Transcript {
+                request: request.clone(),
+                cwd,
+                pane_pid,
+                current_command,
+                config,
+            })
+            .map(|()| {
+                self.ui.transcript.loading = Some(request.clone());
+                request.id
             })
             .map_err(|error| match error {
                 TrySendError::Full(_) => "collector queue is full".to_string(),
@@ -661,12 +760,15 @@ fn worker_loop(rx: Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerResult>) {
                 previous_pane_scroll,
             },
             WorkerRequest::Activate {
+                request_id,
                 target,
                 cwd,
                 pane_pid,
                 current_command,
                 config,
             } => WorkerResult::Activate {
+                request_id,
+                target: target.clone(),
                 result: extension::activate(
                     &config,
                     extension::ActivationRequest {
@@ -679,6 +781,27 @@ fn worker_loop(rx: Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerResult>) {
                         current_command: current_command.as_deref(),
                     },
                 ),
+            },
+            WorkerRequest::Transcript {
+                request,
+                cwd,
+                pane_pid,
+                current_command,
+                config,
+            } => WorkerResult::Transcript {
+                result: extension::transcript(
+                    &config,
+                    extension::TranscriptRequest {
+                        provider: &request.target.provider_id,
+                        pane_id: &request.target.parent_pane_id,
+                        cwd: cwd.as_deref(),
+                        session_id: request.target.session_id.as_deref(),
+                        pane_pid,
+                        current_command: current_command.as_deref(),
+                        agent_id: &request.target.agent_id,
+                    },
+                ),
+                request,
             },
         };
         if tx.send(result).is_err() {
@@ -710,6 +833,8 @@ mod tests {
                 rx,
                 last_refresh: Instant::now(),
                 ui: CapabilityUiState::default(),
+                next_request_id: 0,
+                pending_native_open: None,
             },
             result_tx,
         )
@@ -747,6 +872,8 @@ mod tests {
                 label: "Agent".into(),
                 role: crate::extension::AgentRole::Main,
                 model: None,
+                lifecycle: Default::default(),
+                transcript_available: false,
             }],
             tree: vec![crate::extension::TreeNode {
                 id: target.node_id.clone(),
@@ -912,6 +1039,8 @@ mod tests {
                     label: "Ada".into(),
                     role: crate::extension::AgentRole::Main,
                     model: None,
+                    lifecycle: Default::default(),
+                    transcript_available: false,
                 }],
                 ..Reply::default()
             },
@@ -960,6 +1089,8 @@ mod tests {
                         label: "Agent".into(),
                         role: crate::extension::AgentRole::Main,
                         model: None,
+                        lifecycle: Default::default(),
+                        transcript_available: false,
                     }],
                     ..Reply::default()
                 },

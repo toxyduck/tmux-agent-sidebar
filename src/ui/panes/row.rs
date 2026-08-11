@@ -43,7 +43,21 @@ pub(super) fn render_extension_tree(
     let (Some(inspection), Some(config)) = (inspection, config) else {
         return Vec::new();
     };
-    let mut facts = inspection.reply.facts.clone();
+    let default_agent_id = inspection
+        .reply
+        .agents
+        .iter()
+        .find(|agent| agent.parent_id.is_none())
+        .map(|agent| agent.id.clone())
+        .unwrap_or_else(|| pane_id.to_string());
+    let selected_agent_id = selected_agent_id.unwrap_or(&default_agent_id);
+    let mut facts: Vec<_> = inspection
+        .reply
+        .facts
+        .iter()
+        .filter(|fact| fact.agent_id == selected_agent_id)
+        .cloned()
+        .collect();
     facts.retain(|fact| !is_hidden(config, fact_category(fact)));
     facts.sort_by_key(|fact| {
         config
@@ -68,14 +82,6 @@ pub(super) fn render_extension_tree(
         .map(|node| (node.id.as_str(), node))
         .collect();
     let mut referenced_facts = HashSet::new();
-    let default_agent_id = inspection
-        .reply
-        .agents
-        .iter()
-        .find(|agent| agent.parent_id.is_none())
-        .map(|agent| agent.id.clone())
-        .unwrap_or_else(|| pane_id.to_string());
-    let selected_agent_id = selected_agent_id.unwrap_or(&default_agent_id);
     let mut lines = Vec::new();
     let fact_line = |fact: &crate::extension::Fact, indent: usize| {
         let marker = match fact.evidence {
@@ -97,7 +103,7 @@ pub(super) fn render_extension_tree(
         let target = TreeTarget {
             parent_pane_id: pane_id.to_string(),
             provider_id: provider_id.to_string(),
-            agent_id: default_agent_id.clone(),
+            agent_id: fact.agent_id.clone(),
             node_id: format!("fact:{}", fact.id),
             detail_token: fact.detail_token.clone(),
             is_disclosure: false,
@@ -109,12 +115,9 @@ pub(super) fn render_extension_tree(
         .reply
         .tree
         .iter()
-        .filter(|node| {
-            node.agent_id == selected_agent_id
-                && !is_hidden(config, node.category.as_deref().unwrap_or("core"))
-        })
+        .filter(|node| node.agent_id == selected_agent_id && !is_hidden(config, &node.category))
         .collect();
-    nodes.sort_by_key(|node| category_rank(config, node.category.as_deref().unwrap_or("core")));
+    nodes.sort_by_key(|node| category_rank(config, &node.category));
 
     // A root TreeNode is visible by default. Descendants require an explicit
     // disclosure state, so a dense collector cannot flood the sidebar.
@@ -166,7 +169,7 @@ pub(super) fn render_extension_tree(
             TreeTarget {
                 parent_pane_id: pane_id.to_string(),
                 provider_id: provider_id.to_string(),
-                agent_id: default_agent_id.clone(),
+                agent_id: node.agent_id.clone(),
                 node_id: node.id.clone(),
                 detail_token: node.detail_token.clone(),
                 is_disclosure: has_content,
@@ -186,32 +189,30 @@ pub(super) fn render_extension_tree(
             lines.push(fact_line(fact, 0));
         }
     }
-    let builtins: Vec<_> = inspection
-        .reply
-        .builtins
-        .iter()
-        .filter(|fact| !is_hidden(config, fact_category(fact)))
-        .collect();
-    if !builtins.is_empty() && !is_hidden(config, "builtins") {
+    let builtins = &inspection.reply.builtins;
+    if builtins.agent_id == selected_agent_id && !is_hidden(config, "builtins") {
         let builtins_id = "__builtins__";
         let expanded = ui.is_expanded(pane_id, builtins_id);
-        let exceptions = builtins
+        let exceptions: Vec<_> = builtins
+            .exceptions
             .iter()
-            .filter(|fact| !matches!(fact.evidence, crate::extension::Evidence::Available))
-            .count();
-        let exception_text = if exceptions == 0 {
+            .filter(|fact| !is_hidden(config, fact_category(fact)))
+            .collect();
+        let exception_text = if exceptions.is_empty() {
             String::new()
         } else {
             format!(
-                " ({exceptions} exception{})",
-                if exceptions == 1 { "" } else { "s" }
+                " ({} exception{})",
+                exceptions.len(),
+                if exceptions.len() == 1 { "" } else { "s" }
             )
         };
         let text = truncate_to_width(
             &format!(
-                "  {} Built-ins: {}{}",
+                "  {} Built-ins: {} tools, {} skills{}",
                 if expanded { "▼" } else { "▶" },
-                builtins.len(),
+                builtins.tools_count,
+                builtins.skills_count,
                 exception_text
             ),
             ctx.inner_width,
@@ -225,14 +226,14 @@ pub(super) fn render_extension_tree(
             TreeTarget {
                 parent_pane_id: pane_id.to_string(),
                 provider_id: provider_id.to_string(),
-                agent_id: default_agent_id.clone(),
+                agent_id: builtins.agent_id.clone(),
                 node_id: builtins_id.to_string(),
                 detail_token: None,
                 is_disclosure: true,
             },
         ));
         if expanded {
-            for fact in builtins {
+            for fact in exceptions {
                 lines.push(fact_line(fact, 1));
             }
         }
@@ -254,7 +255,7 @@ pub(super) fn render_extension_tree(
                 TreeTarget {
                     parent_pane_id: pane_id.to_string(),
                     provider_id: provider_id.to_string(),
-                    agent_id: default_agent_id.clone(),
+                    agent_id: selected_agent_id.to_string(),
                     node_id: format!("slot:{}", slot.id),
                     detail_token: None,
                     is_disclosure: false,
@@ -272,7 +273,7 @@ pub(super) fn render_extension_tree(
             TreeTarget {
                 parent_pane_id: pane_id.to_string(),
                 provider_id: provider_id.to_string(),
-                agent_id: default_agent_id.clone(),
+                agent_id: selected_agent_id.to_string(),
                 node_id: "__stale__".into(),
                 detail_token: None,
                 is_disclosure: false,
@@ -289,7 +290,7 @@ pub(super) fn render_extension_tree(
             TreeTarget {
                 parent_pane_id: pane_id.to_string(),
                 provider_id: provider_id.to_string(),
-                agent_id: default_agent_id,
+                agent_id: selected_agent_id.to_string(),
                 node_id: "__error__".into(),
                 detail_token: None,
                 is_disclosure: false,
@@ -300,14 +301,7 @@ pub(super) fn render_extension_tree(
 }
 
 fn fact_category(fact: &crate::extension::Fact) -> &str {
-    fact.category.as_deref().unwrap_or(match fact.id.as_str() {
-        "model" => "model",
-        "instructions" => "instructions",
-        "skills" => "skills",
-        "mcp" => "mcp",
-        "tools" => "tools",
-        _ => "core",
-    })
+    &fact.category
 }
 
 fn is_hidden(config: &crate::extension::ExtensionsConfig, category: &str) -> bool {
@@ -458,32 +452,46 @@ mod tests {
                 facts: vec![
                     Fact {
                         id: "skill-a".into(),
+                        agent_id: "agent-1".into(),
+                        category: "skills".into(),
                         label: "review".into(),
                         detail: String::new(),
                         evidence: Evidence::Available,
                         source: String::new(),
                         detail_token: Some("token-a".into()),
-                        category: Some("skills".into()),
                     },
                     Fact {
                         id: "skill-b".into(),
+                        agent_id: "agent-1".into(),
+                        category: "skills".into(),
                         label: "review".into(),
                         detail: String::new(),
                         evidence: Evidence::Available,
                         source: String::new(),
                         detail_token: Some("token-b".into()),
-                        category: Some("skills".into()),
                     },
                 ],
-                builtins: vec![Fact {
-                    id: "read".into(),
-                    label: "Read".into(),
-                    detail: String::new(),
-                    evidence: Evidence::Available,
-                    source: String::new(),
-                    detail_token: None,
-                    category: None,
+                agents: vec![AgentNode {
+                    id: "agent-1".into(),
+                    parent_id: None,
+                    label: "agent".into(),
+                    model: None,
                 }],
+                builtins: crate::extension::BuiltinSummary {
+                    agent_id: "agent-1".into(),
+                    tools_count: 6,
+                    skills_count: 3,
+                    exceptions: vec![Fact {
+                        id: "read".into(),
+                        agent_id: "agent-1".into(),
+                        category: "tools".into(),
+                        label: "Read".into(),
+                        detail: String::new(),
+                        evidence: Evidence::Error,
+                        source: String::new(),
+                        detail_token: None,
+                    }],
+                },
                 tree: vec![TreeNode {
                     id: "skills".into(),
                     agent_id: "agent-1".into(),
@@ -491,7 +499,7 @@ mod tests {
                     label: "Skills".into(),
                     fact_ids: vec!["skill-a".into(), "skill-b".into()],
                     detail_token: None,
-                    category: Some("skills".into()),
+                    category: "skills".into(),
                 }],
                 ..Reply::default()
             },
@@ -508,15 +516,13 @@ mod tests {
             "claude",
             Some("agent-1"),
             &ui,
-            18,
+            60,
             &theme,
         );
         assert_eq!(collapsed[0].1.node_id, "skills");
-        assert!(
-            collapsed
-                .iter()
-                .any(|(line, _)| line_text(line).contains("Built-ins: 1"))
-        );
+        assert!(collapsed.iter().any(|(line, _)| {
+            line_text(line).contains("Built-ins: 6 tools, 3 skills (1 exception)")
+        }));
         assert!(
             !collapsed
                 .iter()
@@ -534,7 +540,7 @@ mod tests {
             "claude",
             Some("agent-1"),
             &ui,
-            18,
+            60,
             &theme,
         );
         let ids: Vec<_> = expanded
@@ -565,29 +571,67 @@ mod tests {
                         model: None,
                     },
                 ],
+                facts: vec![
+                    Fact {
+                        id: "shared-root".into(),
+                        agent_id: "root".into(),
+                        category: "skills".into(),
+                        label: "review".into(),
+                        detail: String::new(),
+                        evidence: Evidence::Available,
+                        source: String::new(),
+                        detail_token: Some("root-token".into()),
+                    },
+                    Fact {
+                        id: "shared-child".into(),
+                        agent_id: "child".into(),
+                        category: "skills".into(),
+                        label: "review".into(),
+                        detail: String::new(),
+                        evidence: Evidence::Available,
+                        source: String::new(),
+                        detail_token: Some("child-token".into()),
+                    },
+                ],
                 tree: vec![
                     TreeNode {
                         id: "root-skill".into(),
                         agent_id: "root".into(),
                         parent_id: None,
                         label: "root capability".into(),
-                        fact_ids: vec![],
+                        fact_ids: vec!["shared-root".into()],
                         detail_token: None,
-                        category: Some("skills".into()),
+                        category: "skills".into(),
                     },
                     TreeNode {
                         id: "child-skill".into(),
                         agent_id: "child".into(),
                         parent_id: None,
                         label: "child capability".into(),
-                        fact_ids: vec![],
+                        fact_ids: vec!["shared-child".into()],
                         detail_token: None,
-                        category: Some("skills".into()),
+                        category: "skills".into(),
                     },
                 ],
                 ..Reply::default()
             },
         };
+        let mut ui = CapabilityUiState::default();
+        let collapsed = render_extension_tree(
+            Some(&inspection),
+            Some(&ExtensionsConfig {
+                version: 1,
+                ..ExtensionsConfig::default()
+            }),
+            "%1",
+            "claude",
+            Some("child"),
+            &ui,
+            18,
+            &ColorTheme::default(),
+        );
+        assert_eq!(collapsed[0].1.agent_id, "child");
+        ui.toggle(&collapsed[0].1);
         let lines = render_extension_tree(
             Some(&inspection),
             Some(&ExtensionsConfig {
@@ -597,7 +641,7 @@ mod tests {
             "%1",
             "claude",
             Some("child"),
-            &CapabilityUiState::default(),
+            &ui,
             18,
             &ColorTheme::default(),
         );
@@ -605,7 +649,7 @@ mod tests {
             .into_iter()
             .map(|(_, target)| target.node_id)
             .collect();
-        assert_eq!(ids, vec!["child-skill"]);
+        assert_eq!(ids, vec!["child-skill", "fact:shared-child"]);
     }
 
     fn test_ctx<'a>(theme: &'a ColorTheme, inner_width: usize, active: bool) -> RowCtx<'a> {

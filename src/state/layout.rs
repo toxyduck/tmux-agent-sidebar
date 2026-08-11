@@ -298,6 +298,16 @@ impl AppState {
         let line_index = (row as usize - 2) + self.scrolls.panes.offset;
         if let Some(target) = self.layout.tree_line_targets.get(&line_index).cloned() {
             self.selected_navigation_target = Some(NavigationTarget::Tree(target.clone()));
+            if !self
+                .selected_subagent_target
+                .as_ref()
+                .is_some_and(|subagent| {
+                    subagent.parent_pane_id == target.parent_pane_id
+                        && subagent.agent_id == target.agent_id
+                })
+            {
+                self.selected_subagent_target = None;
+            }
             if target.is_disclosure {
                 self.extensions.ui.toggle(&target);
             } else {

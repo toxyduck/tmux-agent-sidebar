@@ -76,6 +76,11 @@ pub enum Evidence {
 #[serde(deny_unknown_fields)]
 pub struct Fact {
     pub id: String,
+    /// Explicit provider AgentNode that owns this fact.
+    pub agent_id: String,
+    /// Stable semantic category (for example `model`, `skills`, `mcp`).
+    /// It is distinct from the dynamic provider fact ID.
+    pub category: String,
     pub label: String,
     #[serde(default)]
     pub detail: String,
@@ -86,10 +91,18 @@ pub struct Fact {
     /// It is deliberately not interpreted as a filesystem path by the UI.
     #[serde(default)]
     pub detail_token: Option<String>,
-    /// Stable semantic category (for example `model`, `skills`, `mcp`).
-    /// It is distinct from the dynamic provider fact ID.
+}
+
+/// Collapsed summary of provider-global built-ins. Counts describe the real
+/// available tool and skill sets; `exceptions` explains only deviations.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BuiltinSummary {
+    pub agent_id: String,
+    pub tools_count: usize,
+    pub skills_count: usize,
     #[serde(default)]
-    pub category: Option<String>,
+    pub exceptions: Vec<Fact>,
 }
 
 /// Provider-neutral identity. `id` is stable within `(provider, session_id)`;
@@ -119,8 +132,7 @@ pub struct TreeNode {
     /// Optional provider-owned token for details attached directly to this node.
     #[serde(default)]
     pub detail_token: Option<String>,
-    #[serde(default)]
-    pub category: Option<String>,
+    pub category: String,
 }
 
 /// Complete text returned by a `detail` request. It is rendered inline by the
@@ -139,7 +151,7 @@ pub struct Detail {
 pub struct Reply {
     pub version: u32,
     pub facts: Vec<Fact>,
-    pub builtins: Vec<Fact>,
+    pub builtins: BuiltinSummary,
     pub slots: BTreeMap<String, String>,
     pub error: Option<String>,
     pub agents: Vec<AgentNode>,
@@ -455,15 +467,13 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
     let valid = |value: &str| !value.is_empty() && value.len() <= MAX_TEXT && is_safe_text(value);
     let mut ids = std::collections::HashSet::new();
     let mut fact_ids = std::collections::HashSet::new();
-    for fact in reply.facts.iter().chain(&reply.builtins) {
+    for fact in reply.facts.iter().chain(&reply.builtins.exceptions) {
         if !valid(&fact.id)
+            || !valid(&fact.agent_id)
+            || !valid(&fact.category)
             || !valid(&fact.label)
             || !fact.detail.is_empty() && (!valid(&fact.detail))
             || !fact.source.is_empty() && (!valid(&fact.source))
-            || fact
-                .category
-                .as_deref()
-                .is_some_and(|category| !valid(category))
             || !fact_ids.insert(fact.id.as_str())
         {
             return Err("invalid or duplicate fact id".into());
@@ -504,6 +514,20 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
     }
     let agent_ids: std::collections::HashSet<&str> =
         reply.agents.iter().map(|node| node.id.as_str()).collect();
+    for fact in reply.facts.iter().chain(&reply.builtins.exceptions) {
+        if !agent_ids.contains(fact.agent_id.as_str()) {
+            return Err("invalid fact agent id".into());
+        }
+    }
+    let builtins_present = reply.builtins.tools_count > 0
+        || reply.builtins.skills_count > 0
+        || !reply.builtins.exceptions.is_empty();
+    if (builtins_present && !valid(&reply.builtins.agent_id))
+        || (!reply.builtins.agent_id.is_empty()
+            && !agent_ids.contains(reply.builtins.agent_id.as_str()))
+    {
+        return Err("invalid built-ins agent id".into());
+    }
     for node in &reply.agents {
         if let Some(parent) = &node.parent_id
             && (!agent_ids.contains(parent.as_str()) || parent == &node.id)
@@ -519,10 +543,7 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
                 .parent_id
                 .as_deref()
                 .is_some_and(|parent| !valid(parent))
-            || node
-                .category
-                .as_deref()
-                .is_some_and(|category| !valid(category))
+            || !valid(&node.category)
             || !ids.insert(node.id.as_str())
         {
             return Err("invalid or duplicate tree id".into());
@@ -568,6 +589,17 @@ fn validate_reply(reply: &Reply) -> Result<(), String> {
         }
         if !agent_ids.contains(node.agent_id.as_str()) {
             return Err("invalid capability agent id".into());
+        }
+        for fact_id in &node.fact_ids {
+            if !valid(fact_id)
+                || reply
+                    .facts
+                    .iter()
+                    .find(|fact| fact.id == *fact_id)
+                    .is_none_or(|fact| fact.agent_id != node.agent_id)
+            {
+                return Err("invalid capability fact id".into());
+            }
         }
     }
     if let Some(detail) = &reply.detail
@@ -665,7 +697,7 @@ mod tests {
         let script = dir.path().join("collector");
         std::fs::write(
             &script,
-            "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in *'\"cwd\":\"/tmp/project\"'*) ;; *) exit 7 ;; esac\nprintf '%s' '{\"version\":1,\"facts\":[{\"id\":\"model\",\"label\":\"model\",\"evidence\":\"observed\"}]}'\n",
+            "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in *'\"cwd\":\"/tmp/project\"'*) ;; *) exit 7 ;; esac\nprintf '%s' '{\"version\":1,\"agents\":[{\"id\":\"root\",\"label\":\"main\"}],\"facts\":[{\"id\":\"model\",\"agent_id\":\"root\",\"category\":\"model\",\"label\":\"model\",\"evidence\":\"observed\"}]}'\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
@@ -692,6 +724,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reply.facts[0].id, "model");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dotfiles_collector_fixture_is_protocol_compatible() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("collector");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s' '{\"version\":1,\"agents\":[{\"id\":\"root\",\"label\":\"main\",\"model\":\"claude-sonnet\"},{\"id\":\"sub-1\",\"parent_id\":\"root\",\"label\":\"research\",\"model\":\"gpt-5\"}],\"facts\":[{\"id\":\"skill-review\",\"agent_id\":\"sub-1\",\"category\":\"skills\",\"label\":\"review\",\"evidence\":\"observed\",\"source\":\"/tmp/project/SKILL.md\",\"detail_token\":\"skill-review\"}],\"builtins\":{\"agent_id\":\"sub-1\",\"tools_count\":6,\"skills_count\":3,\"exceptions\":[{\"id\":\"tool-error\",\"agent_id\":\"sub-1\",\"category\":\"tools\",\"label\":\"browser unavailable\",\"evidence\":\"error\"}]},\"tree\":[{\"id\":\"skills\",\"agent_id\":\"sub-1\",\"label\":\"Skills\",\"category\":\"skills\",\"fact_ids\":[\"skill-review\"]}]}'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let config = ExtensionsConfig {
+            version: 1,
+            providers: BTreeMap::from([(
+                "claude".into(),
+                ProviderConfig {
+                    argv: vec![script.to_string_lossy().into_owned()],
+                    timeout_ms: 100,
+                    env: BTreeMap::new(),
+                },
+            )]),
+            ..ExtensionsConfig::default()
+        };
+
+        let reply =
+            inspect_once(&config, "claude", "%1", Some("/tmp/project"), Some("s1")).unwrap();
+        assert_eq!(reply.tree[0].agent_id, "sub-1");
+        assert_eq!(reply.builtins.tools_count, 6);
+        assert_eq!(reply.builtins.skills_count, 3);
+        assert_eq!(reply.builtins.exceptions.len(), 1);
     }
 
     #[cfg(unix)]
@@ -755,12 +823,13 @@ mod tests {
                     version: 1,
                     facts: vec![Fact {
                         id: "model".into(),
+                        agent_id: "agent".into(),
+                        category: "model".into(),
                         label: "model: test".into(),
                         detail: String::new(),
                         evidence: Evidence::Observed,
                         source: String::new(),
                         detail_token: None,
-                        category: None,
                     }],
                     ..Reply::default()
                 },
@@ -793,12 +862,13 @@ mod tests {
                     version: 1,
                     facts: vec![Fact {
                         id: "old-model".into(),
+                        agent_id: "agent".into(),
+                        category: "model".into(),
                         label: "old".into(),
                         detail: String::new(),
                         evidence: Evidence::Observed,
                         source: String::new(),
                         detail_token: None,
-                        category: None,
                     }],
                     ..Reply::default()
                 },
@@ -860,7 +930,7 @@ mod tests {
                     label: "A".into(),
                     fact_ids: vec![],
                     detail_token: None,
-                    category: None,
+                    category: "core".into(),
                 },
                 TreeNode {
                     id: "b".into(),
@@ -869,7 +939,7 @@ mod tests {
                     label: "B".into(),
                     fact_ids: vec![],
                     detail_token: None,
-                    category: None,
+                    category: "core".into(),
                 },
             ],
             ..Reply::default()
@@ -903,7 +973,7 @@ mod tests {
                     label: "root".into(),
                     fact_ids: vec![],
                     detail_token: None,
-                    category: None,
+                    category: "core".into(),
                 },
                 TreeNode {
                     id: "child".into(),
@@ -912,7 +982,7 @@ mod tests {
                     label: "child".into(),
                     fact_ids: vec![],
                     detail_token: None,
-                    category: None,
+                    category: "core".into(),
                 },
             ],
             ..Reply::default()

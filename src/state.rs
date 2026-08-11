@@ -285,7 +285,16 @@ impl AppState {
                 self.extensions.ui.selected = None;
             }
             NavigationTarget::Tree(tree) => {
-                self.selected_subagent_target = None;
+                if !self
+                    .selected_subagent_target
+                    .as_ref()
+                    .is_some_and(|subagent| {
+                        subagent.parent_pane_id == tree.parent_pane_id
+                            && subagent.agent_id == tree.agent_id
+                    })
+                {
+                    self.selected_subagent_target = None;
+                }
                 self.extensions.ui.selected = Some(tree.clone());
             }
         }

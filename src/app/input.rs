@@ -378,13 +378,14 @@ mod tests {
         handle_key_event(key(KeyCode::Char('j')), &mut state, &flag);
         assert_eq!(
             state.selected_navigation_target,
-            Some(NavigationTarget::Subagent(subagent))
+            Some(NavigationTarget::Subagent(subagent.clone()))
         );
         handle_key_event(key(KeyCode::Down), &mut state, &flag);
         assert_eq!(
             state.selected_navigation_target,
             Some(NavigationTarget::Tree(capability))
         );
+        assert_eq!(state.selected_subagent_target, Some(subagent.clone()));
         handle_key_event(key(KeyCode::Char('k')), &mut state, &flag);
         assert!(matches!(
             state.selected_navigation_target,

@@ -102,8 +102,7 @@ pub fn cmd_view_patch(args: &[String]) -> i32 {
 
 fn resolve_executable(program: &str) -> Result<(), String> {
     if program.contains('/') {
-        return std::path::Path::new(program)
-            .is_file()
+        return executable_file(std::path::Path::new(program))
             .then_some(())
             .ok_or_else(|| format!("diff viewer not found: {program}"));
     }
@@ -111,10 +110,23 @@ fn resolve_executable(program: &str) -> Result<(), String> {
         .and_then(|paths| {
             std::env::split_paths(&paths)
                 .map(|dir| dir.join(program))
-                .find(|path| path.is_file())
+                .find(|path| executable_file(path))
         })
         .map(|_| ())
         .ok_or_else(|| format!("diff viewer not found in PATH: {program}"))
+}
+
+#[cfg(unix)]
+fn executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && path
+            .metadata()
+            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+}
+#[cfg(not(unix))]
+fn executable_file(path: &std::path::Path) -> bool {
+    path.is_file()
 }
 
 fn shell_quote(value: &str) -> String {
@@ -138,6 +150,14 @@ mod tests {
     #[test]
     fn quotes_single_quote_for_posix_shell() {
         assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_executable_viewer() {
+        use std::os::unix::fs::PermissionsExt;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(resolve_executable(file.path().to_str().unwrap()).is_err());
     }
     #[test]
     fn popup_targets_are_serialized_arguments_not_shared_options() {

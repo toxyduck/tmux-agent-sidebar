@@ -66,9 +66,18 @@ pub fn fetch_vcs_entry(path: &str) -> Option<VcsEntry> {
                     .and_then(|text| parse_arc_branch_text(&text))
             })
             .unwrap_or_else(|| "HEAD".into());
-        let diff_stat = run_command_text(&root, "arc", &["diff", "--stat", "--no-color", "--git"])
+        let cached = run_command_text(&root, "arc", &["diff", "--cached", "--numstat", "--git"])
             .as_deref()
-            .and_then(parse_diff_stat);
+            .map(numstat_totals)
+            .unwrap_or((0, 0));
+        let unstaged = run_command_text(&root, "arc", &["diff", "--numstat", "--git"])
+            .as_deref()
+            .map(numstat_totals)
+            .unwrap_or((0, 0));
+        let untracked = arc_untracked_paths(&root)
+            .map(|paths| paths.len())
+            .unwrap_or(0);
+        let diff_stat = Some((cached.0 + unstaged.0 + untracked, cached.1 + unstaged.1));
         return Some(VcsEntry {
             kind: VcsKind::Arc,
             root,
@@ -96,6 +105,22 @@ pub fn fetch_vcs_entry(path: &str) -> Option<VcsEntry> {
         root,
         branch,
         diff_stat,
+    })
+}
+
+fn numstat_totals(text: &str) -> (usize, usize) {
+    text.lines().fold((0, 0), |(adds, dels), line| {
+        let mut fields = line.split('\t');
+        (
+            adds + fields
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+            dels + fields
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+        )
     })
 }
 

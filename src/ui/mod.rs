@@ -51,6 +51,20 @@ pub fn pet_enabled_from_tmux() -> bool {
     pet_enabled_from_options(&opts)
 }
 
+/// Read `@sidebar_show_ports` from tmux global options, defaulting to `false`.
+/// Accepts the same boolean literals as `@sidebar_pet`.
+pub fn show_ports_from_options(opts: &HashMap<String, String>) -> bool {
+    opts.get(tmux::SIDEBAR_SHOW_PORTS)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .map(|s| matches!(s.as_str(), "on" | "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
+
+pub fn show_ports_from_tmux() -> bool {
+    let opts = crate::tmux::get_all_global_options();
+    show_ports_from_options(&opts)
+}
+
 // ── public entry point ──────────────────────────────────────────────
 
 pub fn draw(frame: &mut Frame, state: &mut AppState) {
@@ -162,6 +176,22 @@ mod tests {
             let opts = opts_with(tmux::SIDEBAR_PET, value);
             assert!(
                 !pet_enabled_from_options(&opts),
+                "expected {value} to disable"
+            );
+        }
+    }
+
+    #[test]
+    fn show_ports_defaults_off_and_accepts_boolean_literals() {
+        assert!(!show_ports_from_options(&HashMap::new()));
+        for value in ["on", "ON", "true", "1", "yes"] {
+            let opts = opts_with(tmux::SIDEBAR_SHOW_PORTS, value);
+            assert!(show_ports_from_options(&opts), "expected {value} to enable");
+        }
+        for value in ["off", "false", "0", "no", ""] {
+            let opts = opts_with(tmux::SIDEBAR_SHOW_PORTS, value);
+            assert!(
+                !show_ports_from_options(&opts),
                 "expected {value} to disable"
             );
         }

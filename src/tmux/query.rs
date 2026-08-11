@@ -113,15 +113,18 @@ type CodexPidEntry = (String, usize, u32);
 /// (plus one optional `ps` call for process-backed agent checks), instead of
 /// N+1 subprocess invocations.
 pub fn query_sessions() -> Vec<SessionInfo> {
-    query_sessions_with_process_snapshot().0
+    query_sessions_with_process_snapshot().0.unwrap_or_default()
 }
 
-pub(crate) fn query_sessions_with_process_snapshot() -> (Vec<SessionInfo>, Option<ProcessSnapshot>)
-{
+/// `None` session data means the authoritative tmux query failed. Callers must
+/// retain their prior snapshot rather than treating that transient failure as
+/// proof that every pane disappeared.
+pub(crate) fn query_sessions_with_process_snapshot()
+-> (Option<Vec<SessionInfo>>, Option<ProcessSnapshot>) {
     let pane_format = pane_format();
     let all_panes_output = match run_tmux(&["list-panes", "-a", "-F", &pane_format]) {
         Some(s) => s,
-        None => return (vec![], None),
+        None => return (None, None),
     };
 
     let process_snapshot = process_snapshot_for_panes(&all_panes_output);
@@ -132,7 +135,7 @@ pub(crate) fn query_sessions_with_process_snapshot() -> (Vec<SessionInfo>, Optio
     {
         resolve_codex_permission_modes(&mut sessions_map, &codex_pids, snapshot);
     }
-    (finalize_sessions(sessions_map), process_snapshot)
+    (Some(finalize_sessions(sessions_map)), process_snapshot)
 }
 
 /// Parse the raw `tmux list-panes` output into an indexed session→window→pane

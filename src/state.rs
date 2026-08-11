@@ -145,15 +145,25 @@ pub struct AppState {
     /// Whether the pet animation is drawn and ticked. Loaded once at startup
     /// from the `@sidebar_pet` tmux option. Defaults to `false`.
     pub pet_enabled: bool,
+    /// Whether optional listening-port inspection and rendering are enabled.
+    /// Defaults to `false`; disabled mode never samples ports.
+    pub show_ports: bool,
 }
 
 impl AppState {
     /// Uniform child activation: focus the original pane, then ask the
     /// provider collector to open its native viewer. No pane/session is made.
     pub fn activate_subagent(&mut self, target: SubagentTarget) {
+        if !self.subagent_target_matches_live_inspection(&target) {
+            self.set_flash("Native viewer unavailable: stale subagent target".to_string());
+            return;
+        }
         crate::tmux::select_pane(&target.parent_pane_id);
-        let (session_id, cwd) = self.pane_context(&target.parent_pane_id);
-        if let Err(error) = self.extensions.queue_activate(target, session_id, cwd) {
+        let (_, cwd, pane_pid, current_command) = self.pane_context(&target.parent_pane_id);
+        if let Err(error) = self
+            .extensions
+            .queue_activate(target, cwd, pane_pid, current_command)
+        {
             self.set_flash(format!("Native viewer unavailable: {error}"));
         }
     }
@@ -178,7 +188,7 @@ impl AppState {
         let Some(_) = target.detail_token.as_deref() else {
             return;
         };
-        let (session_id, cwd) = self.pane_context(&target.parent_pane_id);
+        let (session_id, cwd, _, _) = self.pane_context(&target.parent_pane_id);
         if let Err(error) =
             self.extensions
                 .queue_detail(target, session_id, cwd, self.scrolls.panes.offset)
@@ -187,16 +197,41 @@ impl AppState {
         }
     }
 
-    fn pane_context(&self, pane_id: &str) -> (Option<String>, Option<String>) {
+    fn pane_context(
+        &self,
+        pane_id: &str,
+    ) -> (Option<String>, Option<String>, Option<u32>, Option<String>) {
         let Some(pane) = self.pane_by_id(pane_id) else {
-            return (None, None);
+            return (None, None, None, None);
         };
         (
             pane.session_id.clone(),
             std::fs::canonicalize(&pane.path)
                 .ok()
                 .map(|path| path.to_string_lossy().into_owned()),
+            pane.pane_pid,
+            (!pane.current_command.is_empty()).then(|| pane.current_command.clone()),
         )
+    }
+
+    fn subagent_target_matches_live_inspection(&self, target: &SubagentTarget) -> bool {
+        self.pane_by_id(&target.parent_pane_id).is_some_and(|pane| {
+            pane.agent.as_str() == target.provider_id && pane.session_id == target.session_id
+        }) && self
+            .extensions
+            .inspection(
+                &target.parent_pane_id,
+                &target.provider_id,
+                target.session_id.as_deref(),
+            )
+            .is_some_and(|inspection| {
+                !inspection.stale
+                    && inspection
+                        .reply
+                        .agents
+                        .iter()
+                        .any(|agent| agent.id == target.agent_id && agent.parent_id.is_some())
+            })
     }
 
     pub fn close_capability_detail(&mut self) {
@@ -263,6 +298,7 @@ impl AppState {
             bottom_panel_height: crate::ui::BOTTOM_PANEL_HEIGHT,
             sessions: SessionNamesState::new(),
             pet_enabled: false,
+            show_ports: false,
         };
         crate::state::pet::reseed_pet_idle_motion(&mut state);
         state

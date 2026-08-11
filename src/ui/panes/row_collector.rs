@@ -129,14 +129,18 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
         collected.line_to_row.push(None);
 
         for (pane, git_info) in filtered_panes.iter() {
+            let cursor_selected = row_index == state.global.selected_pane_row;
             let is_selected = state.focus_state.sidebar_focused
                 && state.focus_state.focus == Focus::Panes
-                && row_index == state.global.selected_pane_row;
+                && cursor_selected;
 
             let is_active = state.focus_state.focused_pane_id.as_ref() == Some(&pane.pane_id);
 
             let pane_state = state.pane_state(&pane.pane_id);
-            let ports = pane_state.map(|s| s.ports.as_slice());
+            let ports = state
+                .show_ports
+                .then(|| pane_state.map(|s| s.ports.as_slice()))
+                .flatten();
             let task_progress = pane_state.and_then(|s| s.task_progress.as_ref());
             let status_line_idx = collected.lines.len();
             let pane_lines = row::render_pane_lines_with_ports(
@@ -156,7 +160,7 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
             // Capability collectors return stable child identities. Show their
             // tree only for the selected parent and bind clicks directly to
             // those identities; legacy display labels remain non-interactive.
-            if is_selected {
+            if cursor_selected {
                 if let Some(inspection) = state.extensions.inspection(
                     &pane.pane_id,
                     pane.agent.as_str(),
@@ -317,6 +321,36 @@ mod tests {
         assert_eq!(agent_label(&main), "Ada");
         assert_eq!(agent_label(&subagent), "Ada");
         assert_eq!(agent_label(&unknown), "Ada");
+    }
+
+    #[test]
+    fn hidden_ports_reserve_no_row_or_width() {
+        let mut state = AppState::new("%sidebar".into());
+        state.repo_groups = vec![RepoGroup {
+            name: "repo".into(),
+            has_focus: true,
+            panes: vec![(make_pane("%1", PaneStatus::Running), PaneGitInfo::default())],
+        }];
+        state.rebuild_row_targets();
+        state.set_pane_ports("%1", vec![3000, 5173]);
+
+        let hidden = collect(&state, 14);
+        let hidden_text = hidden
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(!hidden_text.iter().any(|line| line.contains(":3000")));
+
+        state.show_ports = true;
+        let visible = collect(&state, 14);
+        let visible_text = visible
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(visible_text.iter().any(|line| line.contains(":3000")));
+        assert!(hidden.lines.len() < visible.lines.len());
     }
 
     #[test]

@@ -9,6 +9,9 @@ use crate::state::BottomTab;
 pub struct PaneRuntimeState {
     pub ports: Vec<u16>,
     pub command: Option<String>,
+    /// Consecutive successful process-snapshot misses. A single miss hides
+    /// volatile port data; two consecutive misses tear down stale agent state.
+    pub process_liveness_misses: u8,
     pub task_progress: Option<TaskProgress>,
     pub task_dismissed_total: Option<usize>,
     pub inactive_since: Option<u64>,

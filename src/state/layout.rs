@@ -320,7 +320,8 @@ impl AppState {
         }
         if let Some(target) = self.layout.subagent_line_targets.get(&line_index).cloned() {
             self.selected_subagent_target = Some(target.clone());
-            self.selected_navigation_target = Some(NavigationTarget::Subagent(target));
+            self.selected_navigation_target = Some(NavigationTarget::Subagent(target.clone()));
+            self.activate_subagent(target);
             return;
         }
         if let Some(Some(agent_row)) = self.layout.line_to_row.get(line_index) {

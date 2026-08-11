@@ -90,6 +90,9 @@ pub const SIDEBAR_CURSOR: &str = "@sidebar_cursor";
 pub const SIDEBAR_REPO_FILTER: &str = "@sidebar_repo_filter";
 pub const SIDEBAR_BOTTOM_HEIGHT: &str = "@sidebar_bottom_height";
 pub const SIDEBAR_PET: &str = "@sidebar_pet";
+/// Enables optional per-pane listening-port inspection and display. Disabled
+/// by default because it requires process and socket inspection.
+pub const SIDEBAR_SHOW_PORTS: &str = "@sidebar_show_ports";
 pub const SIDEBAR_NOTIFICATIONS: &str = "@sidebar_notifications";
 pub const SIDEBAR_NOTIFICATIONS_EVENTS: &str = "@sidebar_notifications_events";
 /// JSON config for external capability collectors. Defaults to the XDG path.

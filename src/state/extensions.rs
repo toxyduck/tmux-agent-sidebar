@@ -279,8 +279,9 @@ enum WorkerRequest {
     },
     Activate {
         target: crate::state::SubagentTarget,
-        session_id: Option<String>,
         cwd: Option<String>,
+        pane_pid: Option<u32>,
+        current_command: Option<String>,
         config: ExtensionsConfig,
     },
 }
@@ -434,8 +435,9 @@ impl ExtensionsState {
     pub fn queue_activate(
         &mut self,
         target: crate::state::SubagentTarget,
-        session_id: Option<String>,
         cwd: Option<String>,
+        pane_pid: Option<u32>,
+        current_command: Option<String>,
     ) -> Result<(), String> {
         let config = self
             .config
@@ -444,8 +446,9 @@ impl ExtensionsState {
         self.control_tx
             .try_send(WorkerRequest::Activate {
                 target,
-                session_id,
                 cwd,
+                pane_pid,
+                current_command,
                 config,
             })
             .map_err(|error| match error {
@@ -586,17 +589,22 @@ fn worker_loop(rx: Receiver<WorkerRequest>, tx: mpsc::Sender<WorkerResult>) {
             },
             WorkerRequest::Activate {
                 target,
-                session_id,
                 cwd,
+                pane_pid,
+                current_command,
                 config,
             } => WorkerResult::Activate {
                 result: extension::activate(
                     &config,
-                    &target.provider_id,
-                    &target.parent_pane_id,
-                    cwd.as_deref(),
-                    session_id.as_deref(),
-                    &target.agent_id,
+                    extension::ActivationRequest {
+                        provider: &target.provider_id,
+                        pane_id: &target.parent_pane_id,
+                        session_id: target.session_id.as_deref(),
+                        subagent_id: &target.agent_id,
+                        cwd: cwd.as_deref(),
+                        pane_pid,
+                        current_command: current_command.as_deref(),
+                    },
                 ),
             },
         };

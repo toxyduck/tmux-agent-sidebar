@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::activity::{self, TaskProgress};
@@ -127,6 +129,7 @@ impl AppState {
         let _ = std::fs::remove_file(activity::log_file_path(pane_id));
     }
 
+    #[cfg(test)]
     fn filter_sessions_to_live_agent_panes(
         sessions: Vec<SessionInfo>,
         live_agent_panes: &HashSet<String>,
@@ -138,6 +141,30 @@ impl AppState {
                 window
                     .panes
                     .retain(|pane| live_agent_panes.contains(&pane.pane_id));
+                if !window.panes.is_empty() {
+                    windows.push(window);
+                }
+            }
+            if !windows.is_empty() {
+                session.windows = windows;
+                out.push(session);
+            }
+        }
+        out
+    }
+
+    fn filter_sessions_after_process_liveness(
+        &self,
+        sessions: Vec<SessionInfo>,
+    ) -> Vec<SessionInfo> {
+        let mut out = Vec::new();
+        for mut session in sessions {
+            let mut windows = Vec::new();
+            for mut window in session.windows {
+                window.panes.retain(|pane| {
+                    self.pane_state(&pane.pane_id)
+                        .is_none_or(|state| state.process_liveness_misses < 2)
+                });
                 if !window.panes.is_empty() {
                     windows.push(window);
                 }
@@ -162,18 +189,19 @@ impl AppState {
         self.refresh_now();
         self.apply_extension_results();
         let (focused, window_active, _, _) = tmux::get_sidebar_pane_info(&self.tmux_pane);
-        let (mut sessions, mut process_snapshot) = tmux::query_sessions_with_process_snapshot();
+        let (sessions, mut process_snapshot) = tmux::query_sessions_with_process_snapshot();
+        let Some(mut sessions) = sessions else {
+            // The tmux query is authoritative only on success. Preserve the
+            // prior pane and extension scopes through transient failures.
+            self.refresh_activity_data();
+            return window_active;
+        };
         self.sweep_dead_bg_shells_if_due(&mut sessions, &mut process_snapshot);
-        if let Some(process_snapshot) = self.refresh_port_data(&sessions, process_snapshot.as_ref())
-        {
-            let sessions = Self::filter_sessions_to_live_agent_panes(
-                sessions,
-                &process_snapshot.live_agent_panes,
-            );
-            self.apply_session_snapshot(focused, sessions);
-        } else {
-            self.apply_session_snapshot(focused, sessions);
+        if self.show_ports {
+            self.refresh_port_data(&sessions, process_snapshot.as_ref());
+            sessions = self.filter_sessions_after_process_liveness(sessions);
         }
+        self.apply_session_snapshot(focused, sessions);
         if self.sessions.dirty {
             self.refresh_session_names();
             self.sessions.dirty = false;
@@ -210,42 +238,78 @@ impl AppState {
         if !self.timers.port_scan_initialized
             || self.timers.last_port_refresh.elapsed() >= PORT_REFRESH_INTERVAL
         {
-            let scanned = crate::port::scan_session_process_snapshot(sessions, process_snapshot)?;
-            let mut updates: Vec<(String, Vec<u16>, Option<String>)> = Vec::new();
-            let mut dead_panes: Vec<String> = Vec::new();
-            for session in sessions {
-                for window in &session.windows {
-                    for pane in &window.panes {
-                        if !scanned.live_agent_panes.contains(&pane.pane_id) {
-                            dead_panes.push(pane.pane_id.clone());
-                        }
-                        updates.push((
-                            pane.pane_id.clone(),
-                            scanned
-                                .ports_by_pane
-                                .get(&pane.pane_id)
-                                .cloned()
-                                .unwrap_or_default(),
-                            scanned.command_by_pane.get(&pane.pane_id).cloned(),
-                        ));
-                    }
-                }
-            }
-            for (pane_id, ports, command) in updates {
-                let pane_state = self.pane_state_mut(&pane_id);
-                pane_state.ports = ports;
-                pane_state.command = command;
-            }
-            for pane_id in dead_panes {
-                Self::clear_dead_agent_metadata(&pane_id);
-                self.clear_pane_state(&pane_id);
-            }
+            let Some(scanned) =
+                crate::port::scan_session_process_snapshot(sessions, process_snapshot)
+            else {
+                // A failed process/socket sample is not an agent liveness
+                // result. Hide volatile ports, retain all agent metadata.
+                self.invalidate_process_sample(sessions);
+                return None;
+            };
+            self.apply_process_sample(sessions, &scanned);
             self.timers.port_scan_initialized = true;
             self.timers.last_port_refresh = std::time::Instant::now();
             return Some(scanned);
         }
 
         None
+    }
+
+    fn apply_process_sample(
+        &mut self,
+        sessions: &[SessionInfo],
+        scanned: &crate::port::PaneProcessSnapshot,
+    ) {
+        let mut updates: Vec<(String, Vec<u16>, Option<String>)> = Vec::new();
+        let mut dead_panes: Vec<String> = Vec::new();
+        for session in sessions {
+            for window in &session.windows {
+                for pane in &window.panes {
+                    updates.push((
+                        pane.pane_id.clone(),
+                        scanned
+                            .ports_by_pane
+                            .get(&pane.pane_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                        scanned.command_by_pane.get(&pane.pane_id).cloned(),
+                    ));
+                }
+            }
+        }
+        for (pane_id, ports, command) in updates {
+            let pane_state = self.pane_state_mut(&pane_id);
+            if scanned.live_agent_panes.contains(&pane_id) {
+                pane_state.process_liveness_misses = 0;
+                pane_state.ports = ports;
+                pane_state.command = command;
+            } else {
+                pane_state.process_liveness_misses =
+                    pane_state.process_liveness_misses.saturating_add(1);
+                pane_state.ports.clear();
+                pane_state.command = None;
+                if pane_state.process_liveness_misses >= 2 {
+                    dead_panes.push(pane_id);
+                }
+            }
+        }
+        for pane_id in dead_panes {
+            Self::clear_dead_agent_metadata(&pane_id);
+        }
+    }
+
+    fn invalidate_process_sample(&mut self, sessions: &[SessionInfo]) {
+        for pane_id in sessions.iter().flat_map(|session| {
+            session
+                .windows
+                .iter()
+                .flat_map(|window| window.panes.iter())
+                .map(|pane| pane.pane_id.as_str())
+        }) {
+            let pane_state = self.pane_state_mut(pane_id);
+            pane_state.ports.clear();
+            pane_state.command = None;
+        }
     }
 
     pub(crate) fn refresh_task_progress(&mut self) {
@@ -850,6 +914,60 @@ mod tests {
         let filtered = AppState::filter_sessions_to_live_agent_panes(sessions, &live);
 
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn process_liveness_preserves_first_miss_then_tears_down_second_miss() {
+        let _guard = tmux::test_mock::install();
+        let sessions = test_session(vec![test_pane("%1")]);
+        let mut state = AppState::new("%sidebar".into());
+        let live = crate::port::PaneProcessSnapshot {
+            ports_by_pane: HashMap::from([("%1".into(), vec![3000])]),
+            command_by_pane: HashMap::from([("%1".into(), "node server.js".into())]),
+            live_agent_panes: HashSet::from(["%1".into()]),
+        };
+        let missing = crate::port::PaneProcessSnapshot::default();
+
+        state.apply_process_sample(&sessions, &live);
+        assert_eq!(state.pane_ports("%1"), Some(&[3000][..]));
+        assert_eq!(state.pane_state("%1").unwrap().process_liveness_misses, 0);
+
+        state.apply_process_sample(&sessions, &missing);
+        assert_eq!(state.pane_ports("%1"), Some(&[][..]));
+        assert_eq!(state.pane_state("%1").unwrap().process_liveness_misses, 1);
+        assert_eq!(
+            state
+                .filter_sessions_after_process_liveness(sessions.clone())
+                .len(),
+            1
+        );
+
+        state.apply_process_sample(&sessions, &missing);
+        assert_eq!(state.pane_state("%1").unwrap().process_liveness_misses, 2);
+        assert!(
+            state
+                .filter_sessions_after_process_liveness(sessions.clone())
+                .is_empty()
+        );
+
+        state.apply_process_sample(&sessions, &live);
+        assert_eq!(state.pane_state("%1").unwrap().process_liveness_misses, 0);
+        assert_eq!(state.pane_ports("%1"), Some(&[3000][..]));
+    }
+
+    #[test]
+    fn failed_process_sample_hides_ports_without_incrementing_liveness() {
+        let sessions = test_session(vec![test_pane("%1")]);
+        let mut state = AppState::new("%sidebar".into());
+        state.set_pane_ports("%1", vec![3000]);
+        state.set_pane_command("%1", Some("node server.js".into()));
+        state.pane_state_mut("%1").process_liveness_misses = 1;
+
+        state.invalidate_process_sample(&sessions);
+
+        assert_eq!(state.pane_ports("%1"), Some(&[][..]));
+        assert_eq!(state.pane_command("%1"), None);
+        assert_eq!(state.pane_state("%1").unwrap().process_liveness_misses, 1);
     }
 
     // ─── refresh_session_names ──────────────────────────────────────

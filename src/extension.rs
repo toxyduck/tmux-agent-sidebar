@@ -67,6 +67,19 @@ pub struct Request<'a> {
     pub subagent_id: Option<&'a str>,
 }
 
+/// Fully-scoped native subagent activation. The worker derives provider,
+/// pane, session, and subagent identity from one selected target; this typed
+/// boundary keeps the execution context from being positional arguments.
+pub struct ActivationRequest<'a> {
+    pub provider: &'a str,
+    pub pane_id: &'a str,
+    pub session_id: Option<&'a str>,
+    pub subagent_id: &'a str,
+    pub cwd: Option<&'a str>,
+    pub pane_pid: Option<u32>,
+    pub current_command: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Evidence {
@@ -352,28 +365,24 @@ pub fn inspect_once(
 /// error. The sidebar always focuses the original pane before showing it.
 pub fn activate(
     config: &ExtensionsConfig,
-    provider: &str,
-    pane_id: &str,
-    cwd: Option<&str>,
-    session_id: Option<&str>,
-    subagent_id: &str,
+    activation: ActivationRequest<'_>,
 ) -> Result<Reply, String> {
     let program = config
         .providers
-        .get(provider)
+        .get(activation.provider)
         .ok_or_else(|| "no collector configured".to_string())?;
     call(
         program,
         &Request {
             version: PROTOCOL_VERSION,
             op: "activate",
-            provider,
-            pane_id,
-            cwd,
-            session_id,
-            pane_pid: None,
-            current_command: None,
-            subagent_id: Some(subagent_id),
+            provider: activation.provider,
+            pane_id: activation.pane_id,
+            cwd: activation.cwd,
+            session_id: activation.session_id,
+            pane_pid: activation.pane_pid,
+            current_command: activation.current_command,
+            subagent_id: Some(activation.subagent_id),
         },
     )
 }
@@ -840,6 +849,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reply.facts[0].id, "model");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_request_preserves_selected_target_and_pane_context() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("collector");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in *'\"op\":\"activate\"'*'\"pane_id\":\"%1\"'*'\"session_id\":\"session\"'*'\"pane_pid\":42'*'\"current_command\":\"claude\"'*'\"subagent_id\":\"child\"'*) ;; *) exit 7 ;; esac\nprintf '%s' '{\"version\":1}'\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let config = ExtensionsConfig {
+            version: 1,
+            providers: BTreeMap::from([(
+                "claude".into(),
+                ProviderConfig {
+                    argv: vec![script.to_string_lossy().into_owned()],
+                    timeout_ms: 100,
+                    env: BTreeMap::new(),
+                },
+            )]),
+            ..ExtensionsConfig::default()
+        };
+
+        activate(
+            &config,
+            ActivationRequest {
+                provider: "claude",
+                pane_id: "%1",
+                session_id: Some("session"),
+                subagent_id: "child",
+                cwd: Some("/tmp/project"),
+                pane_pid: Some(42),
+                current_command: Some("claude"),
+            },
+        )
+        .unwrap();
     }
 
     #[cfg(unix)]

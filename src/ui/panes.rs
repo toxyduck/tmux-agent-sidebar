@@ -427,30 +427,106 @@ fn compute_scroll_offset(state: &mut AppState, total_lines: usize, list_area: Re
     state.scrolls.panes.total_lines = total_lines;
     state.scrolls.panes.visible_height = list_area.height as usize;
 
+    let visible_h = list_area.height as usize;
+    let max_offset = total_lines.saturating_sub(visible_h);
+    state.scrolls.panes.offset = state.scrolls.panes.offset.min(max_offset);
+
     // Auto-scroll to keep selected agent visible
-    if state.focus_state.sidebar_focused && state.focus_state.focus == Focus::Panes {
-        let mut first_line: Option<usize> = None;
-        let mut last_line: Option<usize> = None;
-        for (i, mapping) in state.layout.line_to_row.iter().enumerate() {
-            if *mapping == Some(state.global.selected_pane_row) {
-                if first_line.is_none() {
-                    first_line = Some(i);
-                }
-                last_line = Some(i);
+    if state.focus_state.sidebar_focused
+        && state.focus_state.focus == Focus::Panes
+        && visible_h > 0
+        && let Some((first, last)) = selected_block_lines(state)
+    {
+        let offset = state.scrolls.panes.offset;
+        let block_height = last.saturating_sub(first).saturating_add(1);
+
+        if block_height > visible_h {
+            // An expanded capability tree may be taller than the viewport.
+            // Keeping its trailing edge visible would make the next frame
+            // scroll back to its leading edge, causing a visible flicker.
+            // Keep an already intersecting viewport unchanged; when arriving
+            // from outside, align the selected navigation line deterministically.
+            let viewport_end = offset.saturating_add(visible_h);
+            let intersects_block = offset <= last && viewport_end > first;
+            if !intersects_block {
+                let anchor = selected_navigation_line(state)
+                    .filter(|line| (first..=last).contains(line))
+                    .unwrap_or(first);
+                state.scrolls.panes.offset = anchor.min(max_offset);
             }
-        }
-        if let (Some(first), Some(last)) = (first_line, last_line) {
-            let visible_h = list_area.height as usize;
-            let offset = state.scrolls.panes.offset;
-            if first < offset {
-                state.scrolls.panes.offset = first.saturating_sub(1);
-            } else if last >= offset + visible_h {
-                state.scrolls.panes.offset = (last + 1).saturating_sub(visible_h);
-            }
+        } else if first < offset {
+            state.scrolls.panes.offset = first.saturating_sub(1);
+        } else if last >= offset.saturating_add(visible_h) {
+            state.scrolls.panes.offset = (last + 1).saturating_sub(visible_h);
         }
     }
 
-    state.scrolls.panes.offset
+    state.scrolls.panes.offset.min(max_offset)
+}
+
+fn selected_block_lines(state: &AppState) -> Option<(usize, usize)> {
+    let selected_row = state.global.selected_pane_row;
+    let first = state
+        .layout
+        .line_to_row
+        .iter()
+        .position(|mapping| *mapping == Some(selected_row))?;
+    let last = state
+        .layout
+        .line_to_row
+        .iter()
+        .rposition(|mapping| *mapping == Some(selected_row))?;
+    Some((first, last))
+}
+
+fn selected_navigation_line(state: &AppState) -> Option<usize> {
+    use crate::state::NavigationTarget;
+
+    match state.selected_navigation_target.as_ref() {
+        Some(NavigationTarget::Tree(target)) => state
+            .layout
+            .tree_line_targets
+            .iter()
+            .find_map(|(line, candidate)| (candidate == target).then_some(*line)),
+        Some(NavigationTarget::Subagent(target)) => state
+            .layout
+            .subagent_line_targets
+            .iter()
+            .find_map(|(line, candidate)| (candidate == target).then_some(*line)),
+        Some(NavigationTarget::Pane { row }) => state
+            .layout
+            .line_to_row
+            .iter()
+            .position(|mapping| *mapping == Some(*row)),
+        None => state
+            .extensions
+            .ui
+            .selected
+            .as_ref()
+            .and_then(|target| {
+                state
+                    .layout
+                    .tree_line_targets
+                    .iter()
+                    .find_map(|(line, candidate)| (candidate == target).then_some(*line))
+            })
+            .or_else(|| {
+                state.selected_subagent_target.as_ref().and_then(|target| {
+                    state
+                        .layout
+                        .subagent_line_targets
+                        .iter()
+                        .find_map(|(line, candidate)| (candidate == target).then_some(*line))
+                })
+            })
+            .or_else(|| {
+                state
+                    .layout
+                    .line_to_row
+                    .iter()
+                    .position(|mapping| *mapping == Some(state.global.selected_pane_row))
+            }),
+    }
 }
 
 fn render_pane_rows(
@@ -601,6 +677,82 @@ pub fn draw_detail(frame: &mut Frame, state: &mut AppState, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{NavigationTarget, TreeTarget};
+
+    fn focused_scroll_state(line_to_row: Vec<Option<usize>>, offset: usize) -> AppState {
+        let mut state = AppState::new("%sidebar".into());
+        state.focus_state.sidebar_focused = true;
+        state.focus_state.focus = Focus::Panes;
+        state.global.selected_pane_row = 0;
+        state.layout.line_to_row = line_to_row;
+        state.scrolls.panes.offset = offset;
+        state
+    }
+
+    fn list_area(height: u16) -> Rect {
+        Rect::new(0, 0, 40, height)
+    }
+
+    #[test]
+    fn oversized_selected_block_never_alternates_between_edges() {
+        for initial_offset in [0, 18] {
+            let mut state = focused_scroll_state(vec![Some(0); 36], initial_offset);
+            for _ in 0..30 {
+                assert_eq!(
+                    compute_scroll_offset(&mut state, 36, list_area(18)),
+                    initial_offset
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_tree_anchors_the_selected_navigation_line_when_entering() {
+        let mut lines = vec![None; 20];
+        lines.extend(std::iter::repeat_n(Some(0), 36));
+        lines.extend(std::iter::repeat_n(None, 4));
+        let mut state = focused_scroll_state(lines, 0);
+        let target = TreeTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            agent_id: "agent".into(),
+            node_id: "skill:review".into(),
+            detail_token: None,
+            inline_detail: None,
+            is_disclosure: false,
+        };
+        state.layout.tree_line_targets.insert(38, target.clone());
+        state.selected_navigation_target = Some(NavigationTarget::Tree(target));
+
+        assert_eq!(compute_scroll_offset(&mut state, 60, list_area(18)), 38);
+        assert_eq!(compute_scroll_offset(&mut state, 60, list_area(18)), 38);
+    }
+
+    #[test]
+    fn shrinking_viewport_preserves_an_intersecting_oversized_block() {
+        let mut lines = vec![None; 20];
+        lines.extend(std::iter::repeat_n(Some(0), 36));
+        lines.extend(std::iter::repeat_n(None, 4));
+        let mut state = focused_scroll_state(lines, 0);
+
+        assert_eq!(compute_scroll_offset(&mut state, 60, list_area(40)), 16);
+        assert_eq!(compute_scroll_offset(&mut state, 60, list_area(18)), 16);
+        assert_eq!(compute_scroll_offset(&mut state, 60, list_area(8)), 16);
+    }
+
+    #[test]
+    fn normal_selected_block_uses_existing_autoscroll_and_clamps_offset() {
+        let mut lines = vec![None; 20];
+        lines.extend(std::iter::repeat_n(Some(0), 3));
+        lines.extend(std::iter::repeat_n(None, 7));
+        let mut state = focused_scroll_state(lines, 0);
+
+        assert_eq!(compute_scroll_offset(&mut state, 30, list_area(18)), 5);
+        assert_eq!(compute_scroll_offset(&mut state, 30, list_area(18)), 5);
+
+        state.scrolls.panes.offset = 99;
+        assert_eq!(compute_scroll_offset(&mut state, 30, list_area(18)), 12);
+    }
 
     #[test]
     fn pane_layout_splits_area_into_filter_secondary_list() {

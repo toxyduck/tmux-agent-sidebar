@@ -70,6 +70,13 @@ fn agent_line(
     ))
 }
 
+fn child_is_active(
+    inspection: &crate::extension::Inspection,
+    agent: &crate::extension::AgentNode,
+) -> bool {
+    !inspection.stale && matches!(agent.lifecycle, crate::extension::AgentLifecycle::Running)
+}
+
 pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
     let width = width as usize;
     let theme = &state.theme;
@@ -176,9 +183,9 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                 state.now,
             );
             let mut pane_lines = pane_lines;
-            // Lifecycle is activity, not a selection detail: every rendered
-            // pane keeps its running children visible. Only the synthetic
-            // inactive disclosure receives a tree target; child rows never do.
+            // Activity is not a selection detail: every rendered pane keeps
+            // fresh, running children visible. Only the synthetic inactive
+            // disclosure receives a tree target; child rows never do.
             if let Some(inspection) = state.extensions.inspection(
                 &pane.pane_id,
                 pane.agent.as_str(),
@@ -198,25 +205,23 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                     .filter(|agent| agent.parent_id.is_some())
                     .collect();
                 children.sort_by(|left, right| {
-                    let left_rank =
-                        matches!(left.lifecycle, crate::extension::AgentLifecycle::Running) as u8;
-                    let right_rank =
-                        matches!(right.lifecycle, crate::extension::AgentLifecycle::Running) as u8;
+                    let left_rank = child_is_active(inspection, left) as u8;
+                    let right_rank = child_is_active(inspection, right) as u8;
                     right_rank
                         .cmp(&left_rank)
                         .then_with(|| left.label.cmp(&right.label))
                         .then_with(|| left.id.cmp(&right.id))
                 });
-                for agent in children.iter().copied().filter(|agent| {
-                    matches!(agent.lifecycle, crate::extension::AgentLifecycle::Running)
-                }) {
+                for agent in children
+                    .iter()
+                    .copied()
+                    .filter(|agent| child_is_active(inspection, agent))
+                {
                     pane_lines.push(agent_line("●", agent, theme.accent));
                 }
                 let inactive: Vec<_> = children
                     .into_iter()
-                    .filter(|agent| {
-                        !matches!(agent.lifecycle, crate::extension::AgentLifecycle::Running)
-                    })
+                    .filter(|agent| !child_is_active(inspection, agent))
                     .collect();
                 if !inactive.is_empty() {
                     let target = TreeTarget {
@@ -233,18 +238,13 @@ pub(super) fn collect(state: &AppState, width: u16) -> CollectedRows {
                     let disclosure = if expanded { "▼" } else { "▶" };
                     let line = collected.lines.len() + pane_lines.len();
                     pane_lines.push(Line::from(Span::styled(
-                        format!("  {disclosure} Inactive / unknown ({})", inactive.len()),
+                        format!("  {disclosure} Inactive ({})", inactive.len()),
                         Style::default().fg(theme.text_muted),
                     )));
                     collected.pending_tree.push((line, target));
                     if expanded {
                         for agent in inactive {
-                            let marker = match agent.lifecycle {
-                                crate::extension::AgentLifecycle::Completed => "○",
-                                crate::extension::AgentLifecycle::Unknown => "?",
-                                crate::extension::AgentLifecycle::Running => unreachable!(),
-                            };
-                            pane_lines.push(agent_line(marker, agent, theme.text_muted));
+                            pane_lines.push(agent_line("○", agent, theme.text_muted));
                         }
                     }
                 }
@@ -688,6 +688,9 @@ mod tests {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
             assert!(lines.iter().any(|line| line.contains("Unknown child A")));
+            assert!(lines.iter().any(|line| line.contains("○ Unknown child A")));
+            assert!(lines.iter().any(|line| line.contains("Inactive (1)")));
+            assert!(!lines.iter().any(|line| line.contains("? Unknown child A")));
             assert!(state.extensions.ui.is_expanded(&disclosure));
         }
 
@@ -705,6 +708,89 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         assert!(!lines.iter().any(|line| line.contains("Unknown child A")));
+    }
+
+    #[test]
+    fn stale_inspection_demotes_running_children_into_inactive_disclosure() {
+        let mut pane = make_pane("%1", PaneStatus::Running);
+        pane.session_id = Some("session".into());
+        let mut state = AppState::new("%sidebar".into());
+        state.repo_groups = vec![RepoGroup {
+            name: "repo".into(),
+            has_focus: true,
+            panes: vec![(pane, PaneGitInfo::default())],
+        }];
+        let config = ExtensionsConfig {
+            providers: BTreeMap::from([(
+                "claude".into(),
+                ProviderConfig {
+                    argv: vec!["/bin/true".into()],
+                    timeout_ms: 100,
+                    env: BTreeMap::new(),
+                },
+            )]),
+            ..ExtensionsConfig::default()
+        };
+        let (extensions, queue) = ExtensionsState::with_test_control_queue(config);
+        state.extensions = extensions;
+        let reply = reply_with_children(
+            "main",
+            [("running", "Running child", AgentLifecycle::Running)],
+        );
+        queue.complete_inspect("%1", "claude", Some("session"), Ok(reply));
+        state.extensions.take_results();
+        let fresh_lines = collect(&state, 80)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            fresh_lines
+                .iter()
+                .any(|line| line.contains("● Running child"))
+        );
+        assert!(!fresh_lines.iter().any(|line| line.contains("Inactive (1)")));
+
+        queue.complete_inspect("%1", "claude", Some("session"), Err("timeout".into()));
+        state.extensions.take_results();
+        let disclosure = TreeTarget {
+            parent_pane_id: "%1".into(),
+            provider_id: "claude".into(),
+            session_id: Some("session".into()),
+            agent_id: "main".into(),
+            node_id: INACTIVE_AGENTS_DISCLOSURE.into(),
+            detail_token: None,
+            inline_detail: None,
+            is_disclosure: true,
+        };
+        let stale_lines = collect(&state, 80)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            !stale_lines
+                .iter()
+                .any(|line| line.contains("● Running child"))
+        );
+        assert!(stale_lines.iter().any(|line| line.contains("Inactive (1)")));
+
+        state.extensions.ui.toggle(&disclosure);
+        let expanded_lines = collect(&state, 80)
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            expanded_lines
+                .iter()
+                .any(|line| line.contains("○ Running child"))
+        );
+        assert!(
+            !expanded_lines
+                .iter()
+                .any(|line| line.contains("? Running child"))
+        );
     }
 
     #[test]
